@@ -1,0 +1,7 @@
+# MAC-to-IP Predefined Allocation Table (Optional)
+# If a MAC address is not listed here, the server will automatically assign
+# the next sequential IP from the subnet (e.g. 192.168.1.101, 102, ...).
+#
+mac,ip,hostname,gateway,netmask,dns
+00:1a:2b:3c:4d:01,192.168.1.101,nuc-001,192.168.1.1,255.255.255.0,1.1.1.1,8.8.8.8
+00:1a:2b:3c:4d:02,192.168.1.102,nuc-002,192.168.1.1,255.255.255.0,1.1.1.1,8.8.8.8
