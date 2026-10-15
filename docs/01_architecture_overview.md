@@ -49,6 +49,8 @@ Instead of booting 150 machines into Windows, logging in, writing down keys, and
 2. The technician PC:
    - Saves the Windows key, Serial, and MAC to `inventory.csv`.
    - Allocates the next sequential unique IP (e.g., `192.168.1.101`) and Hostname (`nuc-101`).
+     The subnet, the range and that "next IP" are live settings of the web dashboard (see
+     `03_ip_and_network_config.md`), not constants baked into the image or a file.
    - Returns the configuration to the NUC.
 
 ### Phase 3: Multicast Disk Restore (5–7 minutes for all 20 NUCs)

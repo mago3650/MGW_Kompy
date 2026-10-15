@@ -28,18 +28,24 @@ On the master technician machine (running Linux or Windows with Python 3):
 cd MGW_Kompy
 ./run_server.sh
 ```
-Or specify your preferred network parameters:
+The CLI flags below only seed the **first** run; after that the saved configuration wins:
 ```bash
 python3 server/inventory_server.py \
     --port 8000 \
-    --subnet 192.168.100 \
+    --subnet 192.168.100.0/24 \
     --start-ip 101 \
     --gateway 192.168.100.1 \
     --dns 1.1.1.1,8.8.8.8 \
     --prefix nuc-
 ```
 
-Open your browser to `http://localhost:8000` to view the live dashboard.
+Now open `http://localhost:8000`. In the **Network Settings** panel you set everything else in the
+browser - subnet per pool (any CIDR), range start/end, the **default (next) IP**, gateway, DNS,
+hostname prefix, the default pool, plus the master IP/port the NUCs use to reach this server.
+Nothing there requires editing a file or restarting the server, and the pool the next NUC is
+registered into is taken from these values immediately. The panel also shows the exact
+`ocs_prerun` / `ocs_postrun` commands to paste into Clonezilla (section 4), with the right
+server address already filled in.
 
 ---
 
@@ -77,6 +83,9 @@ Open your browser to `http://localhost:8000` to view the live dashboard.
 To make Clonezilla automatically extract the Windows keys and configure the static IP, add the following parameters to the client boot command or Clonezilla expert options:
 
 ### In Clonezilla Expert Mode:
+Use the two commands shown at the bottom of the dashboard's Network Settings panel (they already
+contain your configured server IP), or the equivalents below:
+
 When prompted for extra parameters, add:
 - **Pre-run command**:
   ```bash

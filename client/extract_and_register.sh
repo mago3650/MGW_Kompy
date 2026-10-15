@@ -37,6 +37,12 @@ fi
 
 API_URL="http://${SERVER_IP}:${SERVER_PORT}/api/register"
 
+# Optional: pin this unit (or a whole batch) to a named subnet pool.
+# The dashboard's "default pool" is injected automatically as DEPLOY_POOL when the
+# script is downloaded from the server; to override it for one batch run, use:
+#   DEPLOY_POOL=office curl -s http://192.168.1.1:8000/client/extract_and_register.sh | bash
+DEPLOY_POOL="${DEPLOY_POOL:-}"
+
 echo "=========================================================="
 echo "   NUC FLEET PRE-RUN: KEY EXTRACTION & REGISTRATION      "
 echo "=========================================================="
@@ -148,7 +154,8 @@ JSON_PAYLOAD=$(cat <<EOF
   "uuid": "${SYS_UUID}",
   "windows_key": "${WIN_KEY}",
   "key_source": "${KEY_SOURCE}",
-  "notes": "Clonezilla PXE Batch"
+  "notes": "Clonezilla PXE Batch",
+  "pool": "${DEPLOY_POOL:-}"
 }
 EOF
 )
