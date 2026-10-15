@@ -72,6 +72,10 @@ MGW_Kompy/
 1. Connect a **24-port Gigabit switch** to an isolated workbench (keep it disconnected from the corporate network so DHCP doesn't conflict).
 2. Connect your **Master / Technician PC** to the switch.
 3. Configure the Master PC with a static IP: `192.168.100.1 / 255.255.255.0`.
+   That address is also what you put in **Network Settings -> Master / server IP**, and the pool you
+   deploy into must be the same network (here: subnet `192.168.100.0/24`). The shipped seed is
+   `192.168.1.0/24`, so set it to `192.168.100.0/24` in the dashboard once - or start with
+   `--subnet 192.168.100.0/24 --start-ip 1 --gateway 192.168.100.1` for the first run only.
 
 ### Step 2: Start the Central Inventory Server
 On the Master PC:
@@ -96,8 +100,10 @@ detail is edited in the browser - no file editing, no restart, no re-deploy.
 Changes are validated (a malformed subnet, a bad gateway/DNS address, a duplicate pool name, an
 address outside the pool's own network are all rejected with a clear message; a next IP that is valid
 but beyond the configured range simply widens that range and says so), they take effect for the very
-next device, and they are persisted to `server/network_config.json` so they survive a restart. The `EXTRA_POOLS` array in
-`run_server.sh` and the CLI flags only **seed the first run**; afterwards the saved file wins
+next device, and they are persisted to `server/network_config.json` so they survive a restart.
+
+The `EXTRA_POOLS` array in `run_server.sh` and the CLI flags only **seed the first run**; afterwards
+the saved file wins
 (delete it, or start with `NO_DEPLOY_CONFIG=1`, to re-seed from the script).
 
 Because the client scripts are served by this server, the configured **server IP, port and default

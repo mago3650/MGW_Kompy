@@ -77,7 +77,7 @@ Each pool is one editable row:
 | Range start / end | Host offsets inside the network (`101`-`250` on a /24 == the classic last-octet range) |
 | Default / next IP | The address handed to the *next* newly registered device. Accepts a full IP (`192.168.1.140`) or an offset (`140`). If it falls outside **Range start/end**, that range is widened to include it and the response says which end moved |
 | Gateway / DNS | Blank gateway = `.1` of the subnet; DNS is a comma-separated list (max 3) |
-| Host prefix | Hostname = prefix + zero-padded offset (`nuc-101`, `off-007`) |
+| Host prefix | Hostname = prefix + zero-padded host offset (`nuc-101`, `off-007`; on a /16 the offset keeps running past 254) |
 
 Buttons per row: **Save** (create/rename/reconfigure), **★** (make it the default pool for devices that
 do not name one), **↻** (restart the range at its first free host), **Delete** (asks for confirmation
