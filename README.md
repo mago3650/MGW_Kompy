@@ -33,6 +33,11 @@ Automated high-speed deployment pipeline for **150 Intel NUC computers**:
 
 **Total time for 150 NUCs: Under 2 hours** (compared to 40+ hours manually).
 
+> **Addressing is a runtime setting.** Subnets, IP ranges and the default (next) IP are edited in the
+> web dashboard and persisted to `server/network_config.json`; the CLI / `run_server.sh` only seed the
+> first run. The dashboard has no login, so keep it on the isolated deployment switch - or start the
+> server with `--read-only` (`DEPLOY_READ_ONLY=1 ./run_server.sh`) to lock editing.
+
 ---
 
 ## Repository Structure
@@ -44,11 +49,14 @@ MGW_Kompy/
 ├── server/
 │   ├── inventory_server.py            # Central Key Vault, IP Allocator & Web UI
 │   ├── ip_pool.csv.template           # (Optional) Predefined MAC-to-IP mapping
+│   ├── network_config.json            # Generated: subnets/pools & default IPs (edited on the web UI)
 │   └── inventory.csv                  # Generated inventory file with all saved keys
 ├── client/
 │   ├── extract_and_register.sh        # Runs in Clonezilla Pre-Run hook
 │   ├── configure_network.sh           # Runs in Clonezilla Post-Run hook
 │   └── extract_key_windows.ps1        # Alternative Windows PowerShell key extractor
+├── tests/
+│   └── test_network_config.py         # python3 tests/test_network_config.py (no dependencies)
 └── docs/
     ├── 01_architecture_overview.md   # System architecture & timing
     ├── 02_clonezilla_lite_server.md   # Step-by-step Clonezilla Lite Server guide
@@ -70,18 +78,49 @@ On the Master PC:
 ```bash
 ./run_server.sh
 ```
-*(Or run `python3 server/inventory_server.py --port 8000 --subnet 192.168.100 --start-ip 101`)*
+Then open **`http://localhost:8000`** and use the **Network Settings** panel: every addressing
+detail is edited in the browser - no file editing, no restart, no re-deploy.
 
-**Multiple subnet pools** are supported for different network environments:
+| Edit in the dashboard | Notes |
+|---|---|
+| Subnet of each pool | Any CIDR: `192.168.100.0/24`, `10.10.35.0/24`, `10.30.0.0/16` ... |
+| Range start / end | Host offsets (`101`-`250` on a /24, `1`-`60000` on a /16) |
+| **Default / next IP** | The address the *next* new NUC receives - type `192.168.100.10` or just `10` |
+| Gateway, DNS | Netmask & CIDR are derived from the subnet you enter |
+| Hostname prefix | `nuc-` -> `nuc-101`, `off-` -> `off-007` |
+| Add / rename / delete pools | Deleting a pool that still has devices asks for confirmation |
+| Default pool (star) | Used for devices that do not name a pool |
+| Master/server IP, port | Used for the hook commands **and injected into the downloaded client scripts** |
+| Fleet target size | Progress bar denominator (150 by default) |
+
+Changes are validated (a malformed subnet, a bad gateway/DNS address, a duplicate pool name, an
+address outside the pool's own network are all rejected with a clear message; a next IP that is valid
+but beyond the configured range simply widens that range and says so), they take effect for the very
+next device, and they are persisted to `server/network_config.json` so they survive a restart. The `EXTRA_POOLS` array in
+`run_server.sh` and the CLI flags only **seed the first run**; afterwards the saved file wins
+(delete it, or start with `NO_DEPLOY_CONFIG=1`, to re-seed from the script).
+
+Because the client scripts are served by this server, the configured **server IP, port and default
+pool are injected on the fly** when a NUC downloads them - you never have to edit
+`client/*.sh` either.
+
+**CLI seeding is still supported** (useful for scripted/headless starts):
 ```bash
+python3 server/inventory_server.py --port 8000 --subnet 192.168.100.0/24 --start-ip 101 --target 150
 python3 server/inventory_server.py \
-    --subnet 192.168.100 --start-ip 1 --gateway 192.168.100.1 \
-    --subnet-pool "name=office,subnet=10.10.35,start=1,max=250,gw=10.10.35.1,prefix=off-" \
-    --subnet-pool "name=depot,subnet=10.30.1,start=1,max=250,gw=10.30.1.1,prefix=dep-"
+    --subnet-pool "name=office,subnet=10.10.35.0/24,start=1,max=250,gw=10.10.35.1,dns=1.1.1.1;8.8.8.8,prefix=off-" \
+    --subnet-pool "name=depot,subnet=10.30.0.0/16,start=1,max=60000,gw=10.30.1.1,prefix=dep-"
 ```
-Edit the `EXTRA_POOLS` array in `run_server.sh` or use `--subnet-pool` on the command line. Devices can be assigned to any pool or reassigned between pools via the Web Dashboard.
+Useful flags: `--config <file>` (where the pools live), `--no-config` (ephemeral),
+`--read-only` (lock the web editor), `--server-ip`, `--target`.
 
-Open your browser to: **`http://localhost:8000`** to view the live deployment dashboard.
+Devices can be assigned to any pool or reassigned between pools (even to one specific IP) from the
+dashboard or via `POST /api/reassign`. See `docs/03_ip_and_network_config.md` for the full API.
+
+Sanity-check the pool logic without any hardware:
+```bash
+python3 tests/test_network_config.py     # 12 checks, stdlib only (also runs under pytest)
+```
 
 ### Step 3: Launch Clonezilla Lite Server (Multicast PXE)
 1. Boot Clonezilla Live on your Master PC (or run it as a server).

@@ -1,0 +1,8 @@
+# Python bytecode
+__pycache__/
+*.pyc
+
+# Generated at runtime by the deployment server
+server/inventory.csv
+server/network_config.json
+server/ip_pool.csv
