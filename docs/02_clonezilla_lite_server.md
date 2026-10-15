@@ -47,6 +47,18 @@ registered into is taken from these values immediately. The panel also shows the
 `ocs_prerun` / `ocs_postrun` commands to paste into Clonezilla (section 4), with the right
 server address already filled in.
 
+Two more panels matter for batch work:
+
+* **Connected NUC Systems** - every unit that has checked in. Press **Edit name / IP** on a row to give
+  that single machine a custom computer name and/or an exact IP out of its pool (nothing is random:
+  you can decide which NUC becomes `reception-pc` on `192.168.100.140`). The post-run hook re-reads the
+  assignment from the server, so a change made while the batch is imaging still lands on that unit.
+* **Fixed IP & name per unit** - reserve `MAC -> IP + name` *before* booting a batch (stored in
+  `server/ip_pool.csv`). Reserved addresses are skipped by the automatic allocator.
+
+The page does not refresh itself: press **Refresh** for the latest state, or switch **Auto-refresh** on
+to poll the tables in place every 5 s while you watch a batch run.
+
 ---
 
 ## 3. Starting Clonezilla Lite Server
@@ -113,8 +125,10 @@ When prompted for extra parameters, add:
    - **Step 2**: The NUC joins the multicast session and waits for the rest of the batch.
    - **Step 3**: Once all 20 NUCs are ready, Multicast restore runs at full Gigabit speed (~5–7 minutes for all 20).
    - **Step 4**: Clonezilla finishes, runs `configure_network.sh`:
-     - Injects unique IP (e.g., `192.168.100.101` to `192.168.100.120`).
-     - Injects hostname (`nuc-101` to `nuc-120`).
+     - Asks the server once more for this MAC's assignment (so dashboard edits win).
+     - Injects unique IP (e.g., `192.168.100.101` to `192.168.100.120`), or the exact IP that was
+       pinned for this unit in the dashboard.
+     - Injects hostname (`nuc-101` to `nuc-120`), or the custom computer name pinned for this unit.
      - Resets `machine-id`.
      - Shuts down.
 5. The dashboard turns green for all 20 units.

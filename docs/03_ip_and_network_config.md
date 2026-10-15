@@ -83,6 +83,11 @@ Buttons per row: **Save** (create/rename/reconfigure), **★** (make it the defa
 do not name one), **↻** (restart the range at its first free host), **Delete** (asks for confirmation
 when devices still use the pool). Global fields: master/server IP, port and the fleet target size.
 
+The page **never reloads itself**: auto-refresh starts **off** (press *Refresh* for the latest state) and
+the *Auto-refresh* button polls `/api/dashboard` every 5 s when you want live tracking - counters, pool
+cards and the NUC table are swapped in place, so an editor you have open is never wiped
+(`?refresh=on` / `?refresh=off` overrides it for one visit; the choice is remembered in `localStorage`).
+
 Everything is validated server-side, applies to the next registration, and is written to
 `server/network_config.json`:
 
@@ -135,8 +140,32 @@ mac,ip,hostname,gateway,netmask,dns
 You can mix subnets here freely — each row can use a completely different network. If a MAC is found in this file, the server returns that explicit assignment. If a MAC is not found, it gracefully falls back to dynamic sequential allocation from the selected pool.
 
 This is the only addressing table that still lives in a file (it is a per-device map rather than a pool
-setting), and it is read once at server start — restart the server after editing it. Those addresses are
-counted as "in use", so pool allocation will skip them.
+setting). You can edit the file directly (restart the server afterwards) **or** use the dashboard's
+*Fixed IP & name per unit* panel, which writes exactly this file (`POST /api/predefine/save`,
+`POST /api/predefine/delete`). Those addresses are counted as "in use", so pool allocation skips them.
+
+### Mode 4: Pin one unit by hand from the NUC table (name and/or exact IP)
+
+The *Connected NUC Systems* table has an **Edit name / IP** button on every row. It opens an inline
+editor for that single machine (identified by its MAC) with three fields:
+
+| Field | Meaning |
+|---|---|
+| Computer name | Anything up to 63 chars (`workshop-01`, `reception`, `lab-a-07`). Tick **auto name from the pool prefix** to leave it to `prefix + host offset` again (`nuc-101`) |
+| IP address | The exact address of the pool you want for this unit (`192.168.1.140`). Tick **next free IP of the pool** to un-pin it and let the allocator choose |
+| Pool | Which pool it belongs to — the editor shows that pool's *next free* address |
+
+* **Save name / IP** applies the change immediately (validate → persist → no restart, no page reload).
+* **Reset to auto** gives the unit the next free IP of the selected pool and lets the name follow it.
+* The same address may only exist once: a duplicate name, a duplicate IP, an address belonging to
+  another pool, a network/broadcast address or an invalid hostname are all refused (HTTP 400/409).
+* Pinned values are stored in `inventory.csv` (the `pinned` column, `ip` / `name` / `ip,name`) and in
+  `ip_pool.csv` when that MAC is also listed there, so a restart reproduces them exactly.
+* `client/configure_network.sh` re-queries `POST /api/register` by MAC in the post-run hook, so a unit
+  that is being imaged while you edit the dashboard still gets the **new** name/IP. Editing the identity
+  of a unit that already reported `CONFIGURED` sets it back to `ASSIGNED` (it has to be re-imaged to pick
+  the change up).
+
 
 ---
 
@@ -156,7 +185,9 @@ Returns all configured subnet pools with their status:
 ### `GET /api/config` / `POST /api/config/save`
 Read or change the whole configuration (pools are re-sent by the dashboard when a pool row is saved).
 `legacy` keys `start_ip`, `max_ip`, `current_ip_counter` and `subnet` are still returned for
-compatibility, `start`/`max`/`network` are the canonical names.
+compatibility, `start`/`max`/`network` are the canonical names. The response also carries
+`read_only`, `predefined` (the MAC pre-assignments), `pool_file` (where that table is stored) and
+`config_path`.
 
 ### `POST /api/pool/save`
 Create (`{"name": ..., "network": ...}`) or update (add `"original_name": "<old name>"`) a pool.
@@ -181,6 +212,39 @@ Move a device to a different pool (assigns a new IP from that pool), or pin it t
 ```json
 {"mac": "aa:bb:cc:dd:ee:01", "pool": "office"}
 {"mac": "aa:bb:cc:dd:ee:01", "pool": "office", "ip": "10.10.35.140"}
+```
+
+### `POST /api/device/update` (alias `/api/device/identity`)
+Set the computer name and/or the exact IP of one registered unit - this is what the *Edit name / IP*
+button calls. Every field is optional:
+```json
+{"mac": "aa:bb:cc:dd:ee:01", "hostname": "workshop-01"}                 # custom computer name
+{"mac": "aa:bb:cc:dd:ee:01", "ip": "192.168.1.140"}                     # exact IP (name follows it when it was never pinned)
+{"mac": "aa:bb:cc:dd:ee:01", "hostname": "", "auto_hostname": true}     # back to prefix+offset
+{"mac": "aa:bb:cc:dd:ee:01", "pool": "office", "auto_ip": true}         # next free IP of another pool
+```
+The response repeats everything the hook needs (`assigned_ip`, `assigned_hostname`, `netmask`, `cidr`,
+`gateway`, `dns`, `pool`) plus `pinned` (`ip`, `name` or `ip,name`), the effective `device` record and a
+`notes` array (e.g. `pool 'office' range widened to ...` when a hand-picked address sat outside the range).
+
+### `POST /api/predefine/save` / `POST /api/predefine/delete`
+Reserve an exact IP + computer name for a MAC that has not booted yet (this is the dashboard's
+*Fixed IP & name per unit* panel, and it writes `ip_pool.csv`):
+```json
+{"mac": "aa:bb:cc:dd:ee:07", "ip": "192.168.1.140", "hostname": "reserved-07"}
+{"mac": "aa:bb:cc:dd:ee:07"}                     # to /api/predefine/delete -> remove the reservation
+```
+`gateway`, `netmask` and `dns` are derived from the pool that owns the address (they can be sent
+explicitly for an address outside every pool). Removing a reservation frees the address again.
+
+### `GET /api/dashboard`
+The fragment endpoint the auto-refresh toggle uses - it returns the same numbers/tables the page was
+rendered with, so the tables can be updated without reloading:
+```json
+{"stats": {"total": 12, "target": 150, "keys_found": 5, "completed": 3, "pinned": 2, "pools": 2,
+           "default_pool": "office", "progress_total": 8.0, "progress_keys": 41.7, "progress_completed": 25.0},
+ "pool_cards": "<div class=\"col-md-4 ...\">...</div>", "rows": "<tr>...</tr>",
+ "predefined_rows": "<tr>...</tr>", "predefined": [ ... ]}
 ```
 
 ### `POST /api/register`
