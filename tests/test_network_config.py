@@ -231,6 +231,207 @@ def test_hook_commands_follow_the_dashboard_settings():
     assert "http://10.1.2.3:9000/client/configure_network.sh" in hooks["postrun"]
 
 
+# ------------------------------------------- per-device computer name and exact IP
+def test_hostname_and_mac_validation():
+    assert S.clean_hostname("  nuc-101 ") == "nuc-101"
+    assert S.clean_hostname("A") == "A"
+    assert S.clean_hostname("workshop-01") == "workshop-01"
+    for bad in ["", "   ", "has space", "bad!", "nuc_101", "-lead", "trail-", "a" * 64, "dot.name"]:
+        try:
+            S.clean_hostname(bad)
+        except ValueError:
+            continue
+        raise AssertionError(f"hostname {bad!r} should have been rejected")
+
+    assert S.clean_mac("AA-BB-CC-DD-EE-FF") == "aa:bb:cc:dd:ee:ff"
+    assert S.clean_mac(" aa:bb:cc:dd:ee:ff ") == "aa:bb:cc:dd:ee:ff"
+    for bad in ["", "aa:bb:cc", "zz:bb:cc:dd:ee:ff", "aabbccddeeff", "aa:bb:cc:dd:ee"]:
+        try:
+            S.clean_mac(bad)
+        except ValueError:
+            continue
+        raise AssertionError(f"MAC {bad!r} should have been rejected")
+
+    assert S.format_pinned({"name", "ip"}) == "ip,name"
+    assert S.parse_pinned("ip,name") == {"ip", "name"}
+    assert S.parse_pinned("") == set() and S.parse_pinned(None) == set()
+
+
+def test_pin_an_exact_ip_and_a_custom_computer_name():
+    tmp = tempfile.mkdtemp()
+    mgr = _manager(tmp)
+    mgr.register_device({"mac": "aa:bb:cc:00:00:01"})
+    mgr.register_device({"mac": "aa:bb:cc:00:00:02"})
+
+    out, code = mgr.set_device_identity("AA:BB:CC:00:00:01", hostname="workshop-01",
+                                        ip="192.168.1.150")
+    assert code == 200, out
+    assert (out["assigned_ip"], out["assigned_hostname"], out["pool"]) == \
+        ("192.168.1.150", "workshop-01", "default"), out
+    assert S.parse_pinned(out["pinned"]) == {"ip", "name"}
+    assert out["device"]["status"] == "ASSIGNED"
+    assert "192.168.1.150" in out["device"]["notes"]
+
+    # the address is reserved now: the next unit must never receive it
+    resp, _ = mgr.register_device({"mac": "aa:bb:cc:00:00:03"})
+    assert resp["assigned_ip"] != "192.168.1.150", resp
+
+    # what the post-run hook reads back must be the pinned identity
+    again, _ = mgr.register_device({"mac": "aa:bb:cc:00:00:01"})
+    assert again["assigned_hostname"] == "workshop-01"
+    assert again["assigned_ip"] == "192.168.1.150"
+    assert again["status"] == "already_registered"
+
+
+def test_identity_input_is_validated():
+    mgr = _manager(tempfile.mkdtemp())
+    mgr.register_device({"mac": "aa:bb:cc:00:00:01"})           # 192.168.1.101
+    mgr.register_device({"mac": "aa:bb:cc:00:00:02"})           # 192.168.1.102
+    mgr.mutate_pool({"name": "office", "network": "10.10.35.0/24", "start": 10, "max": 20})
+
+    cases = [
+        ({"mac": "aa:bb:cc:00:00:01", "hostname": "nuc-102"}, 409),          # name taken
+        ({"mac": "aa:bb:cc:00:00:01", "hostname": "no spaces"}, 400),
+        ({"mac": "aa:bb:cc:00:00:01", "ip": "192.168.1.102"}, 409),          # address taken
+        ({"mac": "aa:bb:cc:00:00:01", "ip": "10.99.0.5"}, 400),              # outside every pool
+        ({"mac": "aa:bb:cc:00:00:01", "ip": "192.168.1.0"}, 400),            # network address
+        ({"mac": "aa:bb:cc:00:00:01", "ip": "192.168.1.255"}, 400),          # broadcast
+        ({"mac": "aa:bb:cc:00:00:01", "ip": "not.an.ip"}, 400),
+        ({"mac": "aa:bb:cc:00:00:01", "pool": "nope", "ip": "10.10.35.11"}, 404),
+        ({"mac": "aa:bb:cc:00:00:01", "pool": "office", "ip": "192.168.1.150"}, 400),  # pool mismatch
+        ({"mac": "aa:bb:cc:00:00:99", "hostname": "ghost"}, 404),            # not registered yet
+        ({"mac": "", "hostname": "ghost"}, 400),
+    ]
+    for payload, want in cases:
+        _, code = mgr.set_device_identity(payload.get("mac", ""),
+                                          hostname=payload.get("hostname"),
+                                          ip=payload.get("ip"),
+                                          pool_name=payload.get("pool"))
+        assert code == want, (payload, code, want)
+
+    # nothing was changed by the rejected calls
+    assert mgr.records["aa:bb:cc:00:00:01"]["assigned_ip"] == "192.168.1.101"
+    assert mgr.records["aa:bb:cc:00:00:01"]["assigned_hostname"] == "nuc-101"
+
+    # a valid cross-pool pin moves the unit into the owning pool
+    out, code = mgr.set_device_identity("aa:bb:cc:00:00:01", ip="10.10.35.11")
+    assert code == 200 and out["pool"] == "office", out
+    assert out["assigned_hostname"] == "nuc-011"     # auto name follows the new offset
+    assert S.parse_pinned(out["pinned"]) == {"ip"}
+
+
+def test_auto_name_follows_and_can_be_given_back():
+    mgr = _manager(tempfile.mkdtemp())
+    mgr.register_device({"mac": "aa:bb:cc:00:00:01"})       # nuc-101
+
+    # pinning only the IP renames the unit after the new offset (the name was never pinned)
+    out, _ = mgr.set_device_identity("aa:bb:cc:00:00:01", ip="192.168.1.140")
+    assert out["assigned_hostname"] == "nuc-140", out
+    assert out["pinned"] == "ip"
+
+    # a typed name is pinned, so a later move keeps it
+    out, _ = mgr.set_device_identity("aa:bb:cc:00:00:01", hostname="fixed-name")
+    assert out["pinned"] == "ip,name"
+    out, _ = mgr.set_device_identity("aa:bb:cc:00:00:01", ip="192.168.1.141")
+    assert out["assigned_hostname"] == "fixed-name", out
+
+    # "auto name" hands the name back to the pool prefix
+    out, _ = mgr.set_device_identity("aa:bb:cc:00:00:01", auto_hostname=True)
+    assert out["assigned_hostname"] == "nuc-141" and out["pinned"] == "ip", out
+
+    # "next free IP" of the pool gives up the pin but keeps the name it had
+    out, _ = mgr.set_device_identity("aa:bb:cc:00:00:01", auto_ip=True)
+    assert out["pinned"] == "", out
+    assert out["assigned_ip"] == "192.168.1.142", out       # 101..141 are used/skipped
+    assert out["assigned_hostname"] == "nuc-142", out
+
+    # a pinned name survives an "auto_ip" renumbering
+    mgr.set_device_identity("aa:bb:cc:00:00:01", hostname="keeper")
+    out, _ = mgr.set_device_identity("aa:bb:cc:00:00:01", auto_ip=True)
+    assert out["assigned_hostname"] == "keeper" and out["pinned"] == "name", out
+
+
+def test_pinned_identity_and_preassignments_survive_a_restart():
+    tmp = tempfile.mkdtemp()
+    mgr = _manager(tmp)
+    mgr.register_device({"mac": "aa:bb:cc:00:00:01"})
+    mgr.set_device_identity("aa:bb:cc:00:00:01", hostname="workshop-01", ip="192.168.1.150")
+    mgr.set_predefined_entry({"mac": "aa:bb:cc:00:00:07", "ip": "192.168.1.120",
+                              "hostname": "reserved-07"})
+
+    # restart exactly like the server does: same files, fresh objects
+    fresh = _manager(tmp)
+    assert fresh.records["aa:bb:cc:00:00:01"]["assigned_hostname"] == "workshop-01"
+    assert fresh.records["aa:bb:cc:00:00:01"]["assigned_ip"] == "192.168.1.150"
+    assert S.parse_pinned(fresh.records["aa:bb:cc:00:00:01"]["pinned"]) == {"ip", "name"}
+    assert fresh.predefined_pool["aa:bb:cc:00:00:07"]["hostname"] == "reserved-07"
+
+    resp, _ = fresh.register_device({"mac": "aa:bb:cc:00:00:07"})
+    assert (resp["assigned_ip"], resp["assigned_hostname"]) == ("192.168.1.120", "reserved-07"), resp
+
+
+def test_preassigned_mac_gets_exactly_that_ip_and_name():
+    tmp = tempfile.mkdtemp()
+    mgr = _manager(tmp)
+    out, code = mgr.set_predefined_entry({"mac": "AA-BB-CC-00-00:07", "ip": "192.168.1.140",
+                                          "hostname": "reserved-07"})
+    assert code == 200 and out["mac"] == "aa:bb:cc:00:00:07", out
+    assert out["pool"] == "default" and out["persisted"] is True
+    assert os.path.exists(mgr.pool_csv)
+
+    # the reservation wins over sequential allocation, and the address is skipped
+    resp, _ = mgr.register_device({"mac": "aa:bb:cc:00:00:07"})
+    assert (resp["assigned_ip"], resp["assigned_hostname"]) == ("192.168.1.140", "reserved-07")
+    assert mgr.records["aa:bb:cc:00:00:07"]["pinned"] == "ip,name"   # shown as a pin in the table
+    assert mgr.register_device({"mac": "aa:bb:cc:00:00:08"})[0]["assigned_ip"] == "192.168.1.101"
+
+    # guards: bad input, duplicate address, already-registered MAC, unknown MAC
+    for payload, want in [
+        ({"mac": "nope", "ip": "192.168.1.141"}, 400),
+        ({"mac": "aa:bb:cc:00:00:09", "ip": "192.168.1.999"}, 400),
+        ({"mac": "aa:bb:cc:00:00:09", "ip": "192.168.1.140"}, 409),      # already reserved
+        ({"mac": "aa:bb:cc:00:00:07", "ip": "192.168.1.141"}, 409),      # already registered
+        ({"mac": "aa:bb:cc:00:00:09", "ip": "192.168.1.141", "hostname": "bad name"}, 400),
+    ]:
+        _, code = mgr.set_predefined_entry(payload)
+        assert code == want, (payload, code, want)
+
+    # an address outside the pool range is still allowed, but reported
+    out, code = mgr.set_predefined_entry({"mac": "aa:bb:cc:00:00:0a", "ip": "192.168.1.20"})
+    assert code == 200 and any("outside" in n for n in out["notes"]), out
+
+    # deleting frees it again
+    out, code = mgr.set_predefined_entry({"mac": "aa:bb:cc:00:00:0a"}, remove=True)
+    assert code == 200 and "aa:bb:cc:00:00:0a" not in out["predefined"], out
+    assert mgr.set_predefined_entry({"mac": "aa:bb:cc:00:00:0a"}, remove=True)[1] == 404
+
+
+def test_dashboard_ships_the_editors_and_auto_refresh_toggle_off():
+    mgr = _manager(tempfile.mkdtemp())
+    mgr.register_device({"mac": "aa:bb:cc:00:00:01"})
+    previous, S.inventory_mgr = S.inventory_mgr, mgr
+    try:
+        handler = S.DeploymentRequestHandler.__new__(S.DeploymentRequestHandler)   # no socket needed
+        rows = handler.render_device_rows(list(mgr.records.values()), handler.pools_payload())
+        for needle in ('class="editor-row', 'edit-device-btn', 'data-f="hostname"', 'data-f="auto_ip"',
+                       'data-act="save-identity"', 'data-act="auto-identity"', 'pool-next'):
+            assert needle in rows, needle
+
+        stats = handler.dashboard_stats(list(mgr.records.values()))
+        assert stats["total"] == 1 and stats["target"] == 150 and stats["pools"] == 1, stats
+
+        page = handler.render_dashboard()
+        assert "auto-refresh-toggle" in page and "Auto-refresh: off" in page
+        assert "refresh-now" in page and "predefined-rows" in page and "device-rows" in page
+        assert 'id="stat-total"' in page
+        # auto-refresh is off unless it was switched on before (?refresh=on / localStorage)
+        assert "localStorage.getItem(AUTO_KEY) === 'on'" in S.DASHBOARD_JS
+        assert "autoRefresh = readAutoRefreshPreference();" in S.DASHBOARD_JS
+        assert "location.reload()" not in S.DASHBOARD_JS      # refreshes must not reload the page
+    finally:
+        S.inventory_mgr = previous
+
+
 if __name__ == "__main__":
     passed = 0
     for name, fn in sorted(globals().items()):

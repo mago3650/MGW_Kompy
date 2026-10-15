@@ -36,15 +36,20 @@ echo "=========================================================="
 echo "   NUC FLEET POST-RUN: UNIQUE NETWORK & IDENTITY SETUP   "
 echo "=========================================================="
 
-# If config cache is missing, fetch from server by MAC
-if [ ! -s "$CONFIG_CACHE" ]; then
-    echo "[*] Config cache missing, querying server for MAC ${MAC_ADDR}..."
-    curl -s -X POST -H "Content-Type: application/json" \
-        -d "{\"mac\": \"${MAC_ADDR}\"}" \
-        "http://${SERVER_IP}:${SERVER_PORT}/api/register" > "$CONFIG_CACHE"
-fi
+# Always ask the server again for the *current* assignment. An IP address or computer
+# name that was pinned in the dashboard after the pre-run hook must still reach this
+# machine, so the pre-run cache is only the fallback for an unreachable server.
+echo "[*] Fetching the current assignment for ${MAC_ADDR}..."
+FRESH_CONFIG=$(curl -s -X POST -H "Content-Type: application/json" \
+    -d "{\"mac\": \"${MAC_ADDR}\"}" \
+    "http://${SERVER_IP}:${SERVER_PORT}/api/register" 2>/dev/null)
 
-if [ ! -s "$CONFIG_CACHE" ]; then
+if echo "$FRESH_CONFIG" | grep -q '"assigned_ip"'; then
+    echo "$FRESH_CONFIG" > "$CONFIG_CACHE"
+    echo "[*] Server returned the latest assignment (dashboard edits win)."
+elif [ -s "$CONFIG_CACHE" ]; then
+    echo "[!] Server did not answer - using the configuration cached during the pre-run."
+else
     echo "[ERROR] Could not retrieve network configuration from server."
     exit 1
 fi
@@ -55,6 +60,13 @@ NETMASK=$(grep -o '"netmask": *"[^"]*"' "$CONFIG_CACHE" | cut -d'"' -f4)
 CIDR=$(grep -o '"cidr": *"[^"]*"' "$CONFIG_CACHE" | cut -d'"' -f4)
 GATEWAY=$(grep -o '"gateway": *"[^"]*"' "$CONFIG_CACHE" | cut -d'"' -f4)
 DNS_SERVERS=$(grep -o '"dns": *"[^"]*"' "$CONFIG_CACHE" | cut -d'"' -f4)
+
+if [ -z "$ASSIGNED_IP" ]; then
+    echo "[ERROR] The server returned no IP address for this unit - fix it in the dashboard."
+    exit 1
+fi
+# A name is never optional: fall back to nuc-<last octet> if the record has none.
+[ -z "$ASSIGNED_HOST" ] && ASSIGNED_HOST="nuc-$(echo "$ASSIGNED_IP" | awk -F. '{print $NF}')"
 
 [ -z "$CIDR" ] && CIDR="24"
 [ -z "$GATEWAY" ] && GATEWAY="192.168.1.1"

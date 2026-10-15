@@ -51,6 +51,8 @@ Instead of booting 150 machines into Windows, logging in, writing down keys, and
    - Allocates the next sequential unique IP (e.g., `192.168.1.101`) and Hostname (`nuc-101`).
      The subnet, the range and that "next IP" are live settings of the web dashboard (see
      `03_ip_and_network_config.md`), not constants baked into the image or a file.
+   - An address or computer name that was **pinned for that MAC in the dashboard** (or reserved before
+     the batch booted) always wins over the sequential allocator.
    - Returns the configuration to the NUC.
 
 ### Phase 3: Multicast Disk Restore (5–7 minutes for all 20 NUCs)
@@ -59,6 +61,9 @@ Instead of booting 150 machines into Windows, logging in, writing down keys, and
 
 ### Phase 4: Post-Run — Unique Network Configuration (10 seconds)
 1. The client executes `configure_network.sh`:
+   - Re-reads the assignment from the server (`POST /api/register` by MAC), so an exact IP or a custom
+     computer name that was pinned in the dashboard *while the NUC was imaging* is applied too
+     (the pre-run cache is only the fallback when the server cannot be reached).
    - Mounts the newly restored Linux root partition.
    - Writes the unique static IP into Netplan / NetworkManager / interfaces.
    - Sets the assigned hostname in `/etc/hostname` and `/etc/hosts`.

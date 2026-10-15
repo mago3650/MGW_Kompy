@@ -3,7 +3,8 @@
 Automated high-speed deployment pipeline for **150 Intel NUC computers**:
 - **Extracts & archives Windows Product Keys** (from ACPI MSDM BIOS table or Windows disk registry) before wiping.
 - **Deploys Clonezilla Linux Image** to **20 computers simultaneously** via Multicast PXE over LAN (takes ~5–7 minutes per batch of 20).
-- **Assigns unique static IP addresses and hostnames** automatically to every machine.
+- **Assigns unique static IP addresses and hostnames** automatically to every machine - and lets you
+  **pin an exact IP and a custom computer name to any single NUC** (before or after it boots).
 - **Wipes `/etc/machine-id` and resets SSH keys** to eliminate network ID conflicts.
 - **Live Web Dashboard & CSV export** to monitor progress and archive license keys.
 
@@ -48,7 +49,7 @@ MGW_Kompy/
 ├── run_server.sh                      # One-click launcher for deployment server
 ├── server/
 │   ├── inventory_server.py            # Central Key Vault, IP Allocator & Web UI
-│   ├── ip_pool.csv.template           # (Optional) Predefined MAC-to-IP mapping
+│   ├── ip_pool.csv.template           # MAC-to-IP/name pre-assignments (editable in the web UI)
 │   ├── network_config.json            # Generated: subnets/pools & default IPs (edited on the web UI)
 │   └── inventory.csv                  # Generated inventory file with all saved keys
 ├── client/
@@ -96,6 +97,10 @@ detail is edited in the browser - no file editing, no restart, no re-deploy.
 | Default pool (star) | Used for devices that do not name a pool |
 | Master/server IP, port | Used for the hook commands **and injected into the downloaded client scripts** |
 | Fleet target size | Progress bar denominator (150 by default) |
+| **Computer name of one unit** | **Edit name / IP** in the NUC table: type any name (`workshop-01`) instead of the pool prefix |
+| **Exact IP of one unit** | Same editor: type the address you want (`192.168.1.140`) - or tick *next free IP* to un-pin it again |
+| **Fixed IP + name per MAC** | "Fixed IP & name per unit": reserve an address *before* the NUC boots (saved to `ip_pool.csv`) |
+| Auto-refresh | **Off by default**; the *Auto-refresh* button polls the tables in place (no page reload) |
 
 Changes are validated (a malformed subnet, a bad gateway/DNS address, a duplicate pool name, an
 address outside the pool's own network are all rejected with a clear message; a next IP that is valid
@@ -123,9 +128,37 @@ Useful flags: `--config <file>` (where the pools live), `--no-config` (ephemeral
 Devices can be assigned to any pool or reassigned between pools (even to one specific IP) from the
 dashboard or via `POST /api/reassign`. See `docs/03_ip_and_network_config.md` for the full API.
 
-Sanity-check the pool logic without any hardware:
+#### Give each NUC exactly the address and name you want (nothing is random)
+
+Automatic allocation is sequential, but you stay in charge of every single unit:
+
+1. **Edit name / IP** - click it on any row of the NUC table to open the editor for that machine:
+   * **Computer name** - type anything (`workshop-01`, `reception-pc`, `lab-a-07`). Tick *auto name
+     from the pool prefix* to hand the name back to `prefix + host` (`nuc-101`).
+   * **IP address** - type the exact address from the pool (`192.168.100.140`). Tick *next free IP of
+     the pool* to let the server pick the next free one again. **Reset to auto** does both at once.
+   * Saving pins the unit: the address is never handed to another machine, and it stays pinned after a
+     server restart. The post-run hook re-reads the assignment from the server, so a change made while
+     a batch is imaging still lands on the right NUC.
+2. **Fixed IP & name per unit** - reserve `MAC -> IP + name` *before* the NUC is even switched on
+   (kept in `server/ip_pool.csv`, the classic MAC-to-IP table). The allocator skips those addresses,
+   so a reserved address can never be handed out twice.
+
+Every custom name/address is validated (a duplicate name, a duplicate address, an address outside
+the pool, an invalid hostname or a network/broadcast address are all refused with a clear message).
+A locked unit is flagged with a small `name` / `ip` badge in the table.
+
+#### Auto-refresh
+
+The dashboard **does not refresh itself by default** - press **Refresh** whenever you want the latest
+data. If you would rather watch the deployment live, press **Auto-refresh** (it turns green and polls
+every 5 s, updating the counters and tables *in place* - the page is never reloaded, and it pauses
+while you are typing in the table). The choice is remembered per browser; `?refresh=on` / `?refresh=off`
+in the URL forces it for one visit.
+
+Sanity-check the pool, naming and pinning logic without any hardware:
 ```bash
-python3 tests/test_network_config.py     # 12 checks, stdlib only (also runs under pytest)
+python3 tests/test_network_config.py     # 19 checks, stdlib only (also runs under pytest)
 ```
 
 ### Step 3: Launch Clonezilla Lite Server (Multicast PXE)
@@ -151,7 +184,8 @@ python3 tests/test_network_config.py     # 12 checks, stdlib only (also runs und
 2. Turn them on and press **F10** (Boot Menu) -> select **UEFI Network Boot / PXE**.
 3. Watch the dashboard at `http://localhost:8000`:
    - Each NUC reports its **MAC address**, **Motherboard Serial Number**, and **Windows Product Key**.
-   - Each NUC receives its assigned unique IP (`192.168.100.101`, `102`, etc.) and Hostname (`nuc-101`, `nuc-102`, etc.).
+   - Each NUC receives its assigned unique IP (`192.168.100.101`, `102`, etc.) and Hostname (`nuc-101`, `nuc-102`, etc.) -
+     unless you pinned an exact IP and/or a custom computer name for that unit in the dashboard.
    - All 20 NUCs stream the Clonezilla Linux image simultaneously.
    - When finished, network configs are injected and each NUC powers off automatically.
 

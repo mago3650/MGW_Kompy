@@ -36,8 +36,18 @@ CONFIG_FILENAME = "network_config.json"
 CSV_FIELDS = [
     "timestamp", "status", "assigned_hostname", "assigned_ip",
     "mac", "serial", "model", "windows_key", "key_source",
-    "notes", "pool", "gateway", "netmask", "dns",
+    "notes", "pool", "gateway", "netmask", "dns", "pinned",
 ]
+
+# What a hand-edited identity can be pinned to. Kept as a CSV column so a restart
+# reproduces exactly the same names/addresses the technician typed.
+PIN_IP = "ip"
+PIN_NAME = "name"
+
+# A plain RFC-1123 style hostname: letters, digits and '-', 1-63 chars, no leading or
+# trailing '-' (dots are refused so a unit can never be named like a domain).
+HOSTNAME_RE = re.compile(r"^[A-Za-z0-9]([A-Za-z0-9-]{0,61}[A-Za-z0-9])?$")
+MAC_RE = re.compile(r"^([0-9a-f]{2}[:-]){5}[0-9a-f]{2}$")
 
 DEFAULT_SETTINGS = {
     "server_ip": "",          # Address clients use to reach this server
@@ -70,6 +80,39 @@ def to_int(value, default):
         return int(str(value).strip())
     except (TypeError, ValueError):
         return default
+
+
+def clean_hostname(value):
+    """Validate a computer name typed by a human. Returns it, raises ValueError otherwise."""
+    name = str(value or "").strip()
+    if not name:
+        raise ValueError("hostname is empty")
+    if len(name) > 63:
+        raise ValueError("hostname is too long (max 63 characters)")
+    if not HOSTNAME_RE.match(name):
+        raise ValueError(
+            f"hostname '{name}' is invalid: use 1-63 letters, digits or '-' "
+            f"(no spaces, dots or underscores, and no leading/trailing '-')")
+    return name
+
+
+def clean_mac(value):
+    """Normalise 'AA-BB-..' / 'aA:bB:..' to lower-case colon notation."""
+    mac = str(value or "").strip().lower().replace("-", ":")
+    if not MAC_RE.match(mac):
+        raise ValueError(f"MAC address '{value}' is invalid (expected aa:bb:cc:dd:ee:ff)")
+    return mac
+
+
+def parse_pinned(value):
+    """'ip,name' -> {'ip', 'name'}; tolerant of the legacy/empty forms."""
+    items = {x.strip().lower() for x in str(value or "").replace(";", ",").split(",")}
+    return {p for p in (PIN_IP, PIN_NAME) if p in items}
+
+
+def format_pinned(pins):
+    """{'name', 'ip'} -> 'ip,name' (stable order for the CSV / JSON output)."""
+    return ",".join(p for p in (PIN_IP, PIN_NAME) if p in (pins or set()))
 
 
 class SubnetPool:
@@ -429,23 +472,76 @@ class InventoryManager:
     def pool_usage(self, pool_name):
         return sum(1 for r in self.records.values() if str(r.get("pool", "")).lower() == str(pool_name).lower())
 
+    # ------------------------------------------------------- identity lookups
+    def address_holder(self, ip, excluding=None):
+        """Who (if anyone) already owns `ip`: another device or a predefined entry."""
+        excluding = str(excluding or "").lower()
+        wanted = str(ip or "").strip()
+        for mac, rec in self.records.items():
+            if mac != excluding and str(rec.get("assigned_ip", "")).strip() == wanted:
+                return rec.get("assigned_hostname") or mac
+        for mac, entry in self.predefined_pool.items():
+            if mac != excluding and str(entry.get("ip", "")).strip() == wanted:
+                return f"pre-assigned to {mac}"
+        return None
+
+    def hostname_holder(self, hostname, excluding=None):
+        """Who (if anyone) already uses `hostname` (case-insensitive)."""
+        excluding = str(excluding or "").lower()
+        wanted = str(hostname or "").strip().lower()
+        for mac, rec in self.records.items():
+            if mac != excluding and str(rec.get("assigned_hostname", "")).strip().lower() == wanted:
+                return rec.get("assigned_ip") or mac
+        return None
+
+    def auto_hostname_for(self, pool, ip):
+        """The name a device gets when nobody typed one: prefix + host offset."""
+        offset = pool.offset_of(ip) if pool else None
+        if offset is None:
+            return ""
+        return pool.hostname_for(offset)
+
+    def device_payload(self, mac, pool=None):
+        """Everything the client hook / the dashboard needs for one device."""
+        record = self.records.get(str(mac or "").lower(), {})
+        pool = pool or self.get_pool_by_name(record.get("pool", "")) or self.default_pool
+        return {
+            "mac": record.get("mac", ""),
+            "assigned_ip": record.get("assigned_ip", ""),
+            "assigned_hostname": record.get("assigned_hostname", ""),
+            "netmask": record.get("netmask") or pool.netmask,
+            "cidr": record.get("cidr") or pool.cidr,
+            "gateway": record.get("gateway") or pool.gateway,
+            "dns": record.get("dns") or pool.dns,
+            "pool": record.get("pool", pool.name),
+            "pinned": record.get("pinned", ""),
+            "status": record.get("status", ""),
+            "notes": record.get("notes", ""),
+        }
+
     # ------------------------------------------------------------------- loading
     def load_predefined_pool(self):
-        if not os.path.exists(self.pool_csv):
+        if not self.pool_csv or not os.path.exists(self.pool_csv):
             return
         try:
             with open(self.pool_csv, "r", encoding="utf-8") as f:
-                reader = csv.DictReader(f)
-                for row in reader:
-                    mac = (row.get("mac") or "").strip().lower()
-                    if mac:
-                        self.predefined_pool[mac] = {
-                            "ip": (row.get("ip") or "").strip(),
-                            "hostname": (row.get("hostname") or "").strip(),
-                            "gateway": (row.get("gateway") or "").strip() or self.gateway,
-                            "netmask": (row.get("netmask") or "").strip() or self.netmask,
-                            "dns": (row.get("dns") or "").strip() or self.dns,
-                        }
+                lines = [ln for ln in f.read().splitlines()
+                         if ln.strip() and not ln.lstrip().startswith("#")]
+            if lines and "mac" not in [c.strip().lower() for c in lines[0].split(",")]:
+                lines.insert(0, "mac,ip,hostname,gateway,netmask,dns")  # tolerated headerless file
+            for row in csv.DictReader(lines):
+                row = {(k or "").strip().lower(): (v or "").strip() for k, v in row.items()}
+                try:
+                    mac = clean_mac(row.get("mac"))
+                except ValueError:
+                    continue
+                self.predefined_pool[mac] = {
+                    "ip": row.get("ip", ""),
+                    "hostname": row.get("hostname", ""),
+                    "gateway": row.get("gateway", "") or self.gateway,
+                    "netmask": row.get("netmask", "") or self.netmask,
+                    "dns": row.get("dns", "") or self.dns,
+                }
             print(f"[*] Loaded {len(self.predefined_pool)} predefined entries from {self.pool_csv}")
         except Exception as e:
             print(f"[!] Warning: Could not load {self.pool_csv}: {e}")
@@ -741,6 +837,8 @@ class InventoryManager:
                     gateway = gateway or owner.gateway
                     dns = dns or owner.dns
                 pool_name_used = "predefined"
+                # a MAC reservation is a pin by definition - show it as such
+                pins = {PIN_IP} | ({PIN_NAME} if assigned_hostname else set())
             else:
                 # Dynamic sequential allocation from the selected pool
                 try:
@@ -752,6 +850,7 @@ class InventoryManager:
                 dns = target_pool.dns
                 cidr = target_pool.cidr
                 pool_name_used = target_pool.name
+                pins = set()
                 # Keep default-pool convenience aliases in sync
                 if target_pool is self.subnet_pools[0]:
                     self.current_ip_counter = target_pool.current_ip_counter
@@ -773,6 +872,7 @@ class InventoryManager:
                 "netmask": netmask,
                 "cidr": cidr,
                 "dns": dns,
+                "pinned": format_pinned(pins),
             }
 
             self.records[mac] = record
@@ -871,6 +971,277 @@ class InventoryManager:
                 "dns": target_pool.dns,
                 "pool": target_pool.name,
             }, 200
+
+    def set_device_identity(self, mac, hostname=None, ip=None, pool_name=None,
+                            auto_ip=False, auto_hostname=False):
+        """Pin an exact IP and/or a custom computer name to one unit.
+
+        The dashboard sends all of these on every save, so the rules are explicit:
+
+        * ``ip`` set        - that exact address is pinned (it must live inside a pool);
+        * ``auto_ip`` set   - the next free address of the target pool is allocated;
+        * neither           - the address the unit already has is kept;
+        * ``hostname`` set  - that exact name is used (validated, must be unique);
+        * ``auto_hostname`` - the name is derived again from prefix + host offset;
+        * neither           - a name that was never pinned follows the address.
+
+        Returns ``(payload, http_code)`` like the other mutating helpers.
+        """
+        with DATA_LOCK:
+            mac = str(mac or "").strip().lower()
+            if not mac:
+                return {"error": "Missing MAC address"}, 400
+            record = self.records.get(mac)
+            if not record:
+                return {"error": f"Device {mac} is not registered yet - "
+                                 f"pre-assign its MAC address instead"}, 404
+
+            notes = []
+            old_ip = str(record.get("assigned_ip", "")).strip()
+            old_name = str(record.get("assigned_hostname", "")).strip()
+            old_pool = str(record.get("pool", "")).strip()
+            pins = parse_pinned(record.get("pinned"))
+
+            # ------------------------------------------------------------ the pool
+            target_pool = self.get_pool_by_name(old_pool) or self.default_pool
+            if pool_name:
+                target_pool = self.get_pool_by_name(pool_name)
+                if not target_pool:
+                    return {"error": f"Pool '{pool_name}' not found"}, 404
+
+            # -------------------------------------------------------------- the IP
+            wanted_ip = str(ip or "").strip()
+            allocated_host = ""
+            if wanted_ip:
+                if not is_ipv4(wanted_ip):
+                    return {"error": f"'{wanted_ip}' is not a valid IPv4 address"}, 400
+                owner = self.get_pool_for_ip(wanted_ip)
+                if not owner:
+                    return {"error": f"{wanted_ip} is not inside any configured pool "
+                                     f"({', '.join(str(p.network) for p in self.subnet_pools)})"}, 400
+                if pool_name and owner is not target_pool:
+                    return {"error": f"{wanted_ip} belongs to pool '{owner.name}', "
+                                     f"not '{target_pool.name}'"}, 400
+                offset = owner.offset_of(wanted_ip)
+                if offset is None or not (1 <= offset <= owner.host_limit):
+                    return {"error": f"{wanted_ip} is not a usable host address in "
+                                     f"{owner.network} (reserved/broadcast address)"}, 400
+                holder = self.address_holder(wanted_ip, excluding=mac)
+                if holder:
+                    return {"error": f"{wanted_ip} is already used by {holder}"}, 409
+                target_pool = owner
+                if offset < target_pool.start_ip or offset > target_pool.max_ip:
+                    # keep the pool bookkeeping honest when a hand-picked address
+                    # lands outside the configured range
+                    target_pool.start_ip = min(target_pool.start_ip, offset)
+                    target_pool.max_ip = max(target_pool.max_ip, offset)
+                    notes.append(f"pool '{target_pool.name}' range widened to "
+                                 f"{target_pool.ip_at(target_pool.start_ip)}-"
+                                 f"{target_pool.ip_at(target_pool.max_ip)}")
+                assigned_ip = target_pool.ip_at(offset)
+                pins.add(PIN_IP)
+            elif auto_ip or not target_pool.contains(old_ip):
+                taken = self.taken_offsets(target_pool)
+                if target_pool.contains(old_ip):
+                    taken.discard(target_pool.offset_of(old_ip))  # our own lease is free again
+                try:
+                    assigned_ip, allocated_host = target_pool.allocate_next(taken)
+                except ValueError as exc:
+                    return {"error": str(exc)}, 409
+                pins.discard(PIN_IP)
+            else:
+                assigned_ip = old_ip
+
+            # -------------------------------------------------------- the hostname
+            given_name = None if hostname is None else str(hostname).strip()
+            if given_name:
+                try:
+                    assigned_hostname = clean_hostname(given_name)
+                except ValueError as exc:
+                    return {"error": str(exc)}, 400
+                pins.add(PIN_NAME)
+            elif auto_hostname:
+                assigned_hostname = self.auto_hostname_for(target_pool, assigned_ip)
+                pins.discard(PIN_NAME)
+            elif PIN_NAME in pins:
+                assigned_hostname = old_name          # keep the name that was typed before
+            else:
+                assigned_hostname = (allocated_host
+                                     or self.auto_hostname_for(target_pool, assigned_ip)
+                                     or old_name)
+            if not assigned_hostname:
+                return {"error": "no hostname could be derived for this address - "
+                                 "type one explicitly"}, 400
+            clash = self.hostname_holder(assigned_hostname, excluding=mac)
+            if clash:
+                return {"error": f"hostname '{assigned_hostname}' is already used by {clash} "
+                                 f"- pick another name"}, 409
+
+            changed = (assigned_ip != old_ip or assigned_hostname != old_name
+                       or target_pool.name != old_pool)
+            record.update({
+                "assigned_ip": assigned_ip,
+                "assigned_hostname": assigned_hostname,
+                "pool": target_pool.name,
+                "gateway": target_pool.gateway,
+                "netmask": target_pool.netmask,
+                "cidr": target_pool.cidr,
+                "dns": target_pool.dns,
+                "pinned": format_pinned(pins),
+            })
+            if changed:
+                bits = []
+                if assigned_ip != old_ip:
+                    bits.append(f"IP {old_ip or '-'} -> {assigned_ip}")
+                if assigned_hostname != old_name:
+                    bits.append(f"name {old_name or '-'} -> {assigned_hostname}")
+                if target_pool.name != old_pool:
+                    bits.append(f"pool {old_pool or '-'} -> {target_pool.name}")
+                record["status"] = "ASSIGNED"
+                record["notes"] = "Set in the dashboard: " + ", ".join(bits)
+                record["timestamp"] = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+
+            # Never hand the same address out twice: keep the cursor ahead of a pin.
+            offset = target_pool.offset_of(assigned_ip)
+            if offset is not None and offset + 1 > target_pool.current_ip_counter:
+                target_pool.current_ip_counter = target_pool._clean_offset(
+                    offset + 1, 1, target_pool.host_limit + 1, target_pool.start_ip)
+            self._sync_aliases()
+
+            # A MAC that is also in ip_pool.csv must not contradict the dashboard.
+            if mac in self.predefined_pool:
+                self.predefined_pool[mac].update({
+                    "ip": assigned_ip, "hostname": assigned_hostname,
+                    "gateway": target_pool.gateway, "netmask": target_pool.netmask,
+                    "dns": target_pool.dns})
+                self.save_predefined_pool()
+
+            self.save_record_to_csv()
+            self.save_config()
+            print(f"[*] IDENTITY SET {mac}: host={assigned_hostname} ip={assigned_ip} "
+                  f"pool={target_pool.name} pinned=[{format_pinned(pins)}]")
+
+            device = self.device_payload(mac, target_pool)
+            payload = dict(device)
+            payload.update({"status": "success", "result": "success", "notes": notes,
+                            "device": device,
+                            "pools": [p.to_dict() for p in self.subnet_pools],
+                            "settings": dict(self.settings)})
+            return payload, 200
+
+    # --------------------------------------------------- MAC pre-assignments
+    def predefined_payload(self):
+        """The ip_pool.csv table as the dashboard shows it."""
+        items = []
+        for mac, entry in sorted(self.predefined_pool.items()):
+            owner = self.get_pool_for_ip(entry.get("ip"))
+            items.append({
+                "mac": mac,
+                "ip": entry.get("ip", ""),
+                "hostname": entry.get("hostname", ""),
+                "gateway": entry.get("gateway", ""),
+                "netmask": entry.get("netmask", ""),
+                "dns": entry.get("dns", ""),
+                "pool": owner.name if owner else "",
+                "registered": mac in self.records,
+            })
+        return items
+
+    def save_predefined_pool(self):
+        """Rewrite the MAC table file from memory so the pre-assignments survive a restart."""
+        if not self.pool_csv:
+            return None
+        header = [
+            "# MAC-to-IP Predefined Allocation Table - written by the MGW_Kompy dashboard",
+            "# A MAC listed here always gets the IP/hostname below, and that address is",
+            "# reserved, so the automatic allocator will never hand it to another unit.",
+            "mac,ip,hostname,gateway,netmask,dns",
+        ]
+        temp_file = self.pool_csv + ".tmp"
+        os.makedirs(os.path.dirname(os.path.abspath(self.pool_csv)) or ".", exist_ok=True)
+        with open(temp_file, "w", newline="", encoding="utf-8") as f:
+            f.write("\n".join(header) + "\n")
+            writer = csv.writer(f)
+            for mac, entry in sorted(self.predefined_pool.items()):
+                writer.writerow([mac, entry.get("ip", ""), entry.get("hostname", ""),
+                                 entry.get("gateway", ""), entry.get("netmask", ""),
+                                 entry.get("dns", "")])
+        os.replace(temp_file, self.pool_csv)
+        return True
+
+    def set_predefined_entry(self, payload, remove=False):
+        """Create/replace - or delete - a 'this MAC always gets this IP and name' row."""
+        with DATA_LOCK:
+            try:
+                mac = clean_mac(payload.get("mac"))
+            except ValueError as exc:
+                return {"error": str(exc),
+                        "predefined": self.predefined_payload()}, 400
+
+            if remove:
+                if mac not in self.predefined_pool:
+                    return {"error": f"{mac} is not pre-assigned",
+                            "predefined": self.predefined_payload()}, 404
+                self.predefined_pool.pop(mac)
+                persisted = bool(self.save_predefined_pool())
+                print(f"[-] Pre-assignment for {mac} removed")
+                return {"status": "deleted", "mac": mac, "persisted": persisted,
+                        "predefined": self.predefined_payload()}, 200
+
+            ip = str(payload.get("ip", "")).strip()
+            if not is_ipv4(ip):
+                return {"error": f"'{ip}' is not a valid IPv4 address",
+                        "predefined": self.predefined_payload()}, 400
+            raw_name = str(payload.get("hostname", "") or "").strip()
+            if raw_name:
+                try:
+                    raw_name = clean_hostname(raw_name)
+                except ValueError as exc:
+                    return {"error": str(exc),
+                            "predefined": self.predefined_payload()}, 400
+            if mac in self.records:
+                return {"error": f"{mac} is already registered as "
+                                 f"{self.records[mac].get('assigned_ip', '')} - edit that device "
+                                 f"instead of pre-assigning it",
+                        "predefined": self.predefined_payload()}, 409
+            holder = self.address_holder(ip, excluding=mac)
+            if holder:
+                return {"error": f"{ip} is already used by {holder}",
+                        "predefined": self.predefined_payload()}, 409
+
+            owner = self.get_pool_for_ip(ip)
+            netmask = str(payload.get("netmask", "") or "").strip()
+            gateway = str(payload.get("gateway", "") or "").strip()
+            dns = str(payload.get("dns", "") or "").strip()
+            if not is_ipv4(netmask):
+                netmask = owner.netmask if owner else "255.255.255.0"
+            try:
+                network = ipaddress.IPv4Network(f"{ip}/{netmask}", strict=False)
+            except ValueError:
+                return {"error": f"'{netmask}' is not a valid netmask for {ip}",
+                        "predefined": self.predefined_payload()}, 400
+            address = ipaddress.IPv4Address(ip)
+            if address in (network.network_address, network.broadcast_address):
+                return {"error": f"{ip} is a network/broadcast address, not a host address",
+                        "predefined": self.predefined_payload()}, 400
+            if not is_ipv4(gateway):
+                gateway = owner.gateway if owner else str(network.network_address + 1)
+            if not dns:
+                dns = owner.dns if owner else self.default_pool.dns
+
+            self.predefined_pool[mac] = {"ip": ip, "hostname": raw_name,
+                                         "gateway": gateway, "netmask": netmask, "dns": dns}
+            persisted = bool(self.save_predefined_pool())
+            notes = []
+            if owner and not (owner.start_ip <= owner.offset_of(ip) <= owner.max_ip):
+                notes.append(f"{ip} is outside pool '{owner.name}' range "
+                             f"{owner.ip_at(owner.start_ip)}-{owner.ip_at(owner.max_ip)} "
+                             f"(reserved here anyway)")
+            print(f"[+] Pre-assigned {mac} -> {ip}{' (' + raw_name + ')' if raw_name else ''}"
+                  f"{' [pool ' + owner.name + ']' if owner else ''}")
+            return {"status": "success", "mac": mac, "ip": ip, "hostname": raw_name,
+                    "pool": owner.name if owner else "", "persisted": persisted,
+                    "notes": notes, "predefined": self.predefined_payload()}, 200
 
     def set_pool_next_ip(self, pool_name, value):
         """Move a pool's allocator ('default IP' for the next device)."""
@@ -990,8 +1361,26 @@ class DeploymentRequestHandler(SimpleHTTPRequestHandler):
                     "read_only": inventory_mgr.read_only,
                     "settings": dict(inventory_mgr.settings),
                     "pools": self.pools_payload(),
+                    "predefined": inventory_mgr.predefined_payload(),
+                    "pool_file": os.path.abspath(inventory_mgr.pool_csv or ""),
                 }
             self.send_json(payload)
+            return
+
+        elif parsed.path == "/api/dashboard":
+            # Everything the page needs to update itself *without* a reload: the counters,
+            # the pool cards and the NUC table (plus the per-device editors inside it).
+            with DATA_LOCK:
+                records = list(inventory_mgr.records.values())
+                pools_data = self.pools_payload()
+                predefined = inventory_mgr.predefined_payload()
+            self.send_json({
+                "stats": self.dashboard_stats(records),
+                "pool_cards": self.render_pool_cards(pools_data),
+                "rows": self.render_device_rows(records, pools_data),
+                "predefined_rows": self.render_predefined_rows(predefined),
+                "predefined": predefined,
+            })
             return
 
         elif parsed.path == "/api/hooks":
@@ -1085,6 +1474,25 @@ class DeploymentRequestHandler(SimpleHTTPRequestHandler):
                 self.send_json(resp, code)
                 return
 
+            elif parsed.path in ("/api/device/update", "/api/device/identity"):
+                # Pin a custom computer name and/or an exact IP from the pool to one unit.
+                resp, code = inventory_mgr.set_device_identity(
+                    body.get("mac", ""),
+                    hostname=body.get("hostname"),
+                    ip=body.get("ip"),
+                    pool_name=body.get("pool") or None,
+                    auto_ip=bool(body.get("auto_ip")),
+                    auto_hostname=bool(body.get("auto_hostname")),
+                )
+                self.send_json(resp, code)
+                return
+
+            elif parsed.path in ("/api/predefine/save", "/api/predefine/delete"):
+                resp, code = inventory_mgr.set_predefined_entry(
+                    body, remove=parsed.path.endswith("delete"))
+                self.send_json(resp, code)
+                return
+
             elif parsed.path in ("/api/pool/save", "/api/pool/add"):
                 resp = inventory_mgr.mutate_pool(body, "save" if parsed.path.endswith("save") else "create")
                 self.send_json(resp)
@@ -1122,24 +1530,34 @@ class DeploymentRequestHandler(SimpleHTTPRequestHandler):
         self.send_json({"error": "not found"}, 404)
 
     # ---------------------------------------------------------------- dashboard
-    def render_dashboard(self):
-        with DATA_LOCK:
-            records = list(inventory_mgr.records.values())
-            pools_data = self.pools_payload()
-            settings = dict(inventory_mgr.settings)
-
+    def dashboard_stats(self, records=None):
+        records = list(inventory_mgr.records.values()) if records is None else records
+        settings = inventory_mgr.settings
         total = len(records)
-        target = settings.get("target_count", 150)
         keys_found = sum(1 for r in records
                          if r.get("windows_key") and r.get("windows_key") not in ("NOT_FOUND", "UNKNOWN", ""))
         completed = sum(1 for r in records if r.get("status") in ("CONFIGURED", "FINISHED", "COMPLETED"))
+        pinned = sum(1 for r in records if r.get("pinned"))
+        target = max(1, to_int(settings.get("target_count"), 150))
+        return {
+            "total": total,
+            "target": target,
+            "keys_found": keys_found,
+            "completed": completed,
+            "pinned": pinned,
+            "pools": len(inventory_mgr.subnet_pools),
+            "default_pool": settings.get("default_pool", "default"),
+            "progress_total": round(min(100, total / target * 100), 1),
+            "progress_keys": round(min(100, keys_found / max(total, 1) * 100), 1),
+            "progress_completed": round(min(100, completed / max(total, 1) * 100), 1),
+        }
 
-        # Build pool summary cards HTML
-        pool_cards_html = ""
+    def render_pool_cards(self, pools_data):
+        html = ""
         for p in pools_data:
             pct = int((p["current_ip_counter"] - p["start"]) / max(p["size"], 1) * 100)
             star = " &#9733;" if p["is_default"] else ""
-            pool_cards_html += f"""
+            html += f"""
             <div class="col-md-4 col-sm-6">
                 <div class="card stat-card bg-white p-3">
                     <div class="d-flex justify-content-between align-items-start">
@@ -1156,10 +1574,41 @@ class DeploymentRequestHandler(SimpleHTTPRequestHandler):
                 </div>
             </div>
             """
+        return html or '<div class="col-12 text-muted">No pools configured.</div>'
 
-        # Build table rows
+    def render_predefined_rows(self, predefined):
+        if not predefined:
+            return ("<tr><td colspan='5' class='text-center text-muted py-3'>Nothing reserved yet - "
+                    "every unit gets the next free address of its pool. Add a MAC above to fix "
+                    "an exact IP / computer name for one machine.</td></tr>")
+        rows = ""
+        for item in predefined:
+            badge = (" <span class='badge bg-light text-dark border'>registered</span>"
+                     if item.get("registered") else "")
+            name = (html_escape(item.get("hostname", "")) or
+                    '<span class="text-muted">(from pool prefix)</span>')
+            rows += f"""
+            <tr>
+                <td><code>{html_escape(item['mac'])}</code>{badge}</td>
+                <td><code>{html_escape(item['ip'])}</code></td>
+                <td>{name}</td>
+                <td><span class="badge bg-light text-dark border">{html_escape(item['pool'] or 'outside pools')}</span>
+                    <small class="text-muted">{html_escape(item['gateway'])} / {html_escape(item['netmask'])}</small></td>
+                <td class="text-end">
+                    <button class="btn btn-outline-danger btn-sm pre-delete"
+                            data-mac="{html_escape(item['mac'], quote=True)}">Remove</button>
+                </td>
+            </tr>
+            """
+        return rows
+
+    def render_device_rows(self, records, pools_data):
+        """The NUC table plus a hidden per-device editor (name / exact IP) under each row."""
+        total = len(records)
+        pool_names = [p["name"] for p in pools_data]
         rows_html = ""
         for idx, r in enumerate(reversed(records), 1):
+            mac = r.get("mac", "")
             key_val = r.get("windows_key", "NOT_FOUND")
             key_badge = (f"<span class='badge bg-success font-monospace'>{html_escape(key_val)}</span>"
                          if key_val != "NOT_FOUND"
@@ -1170,41 +1619,108 @@ class DeploymentRequestHandler(SimpleHTTPRequestHandler):
                 status_cls = "bg-success"
             elif status == "CLONING":
                 status_cls = "bg-warning text-dark"
-            elif status == "REASSIGNED":
+            elif status in ("REASSIGNED", "ASSIGNED"):
                 status_cls = "bg-info text-dark"
             elif "ERROR" in status:
                 status_cls = "bg-danger"
 
             pool_name = r.get("pool", "default")
+            hostname = r.get("assigned_hostname", "")
+            ip = r.get("assigned_ip", "")
+            pins = parse_pinned(r.get("pinned"))
+            pin_badges = ""
+            if PIN_NAME in pins:
+                pin_badges += (" <span class='badge bg-light text-dark border' title='computer name was "
+                               "typed by hand - it will not follow the pool prefix'>name</span>")
+            if PIN_IP in pins:
+                pin_badges += (" <span class='badge bg-light text-dark border' title='IP address was "
+                               "picked by hand - the allocator will never reuse or renumber it'>ip</span>")
             pool_badge = f"<span class='badge bg-light text-dark border'>{html_escape(pool_name)}</span>"
 
-            row_pool_options = "".join(
-                f"<option value='{html_escape(p['name'], quote=True)}'>{html_escape(p['name'])} "
-                f"({html_escape(p['network'])})</option>" for p in pools_data if p["name"] != pool_name)
+            options = ""
+            for p in pools_data:
+                selected = " selected" if p["name"] == pool_name else ""
+                options += (f"<option value='{html_escape(p['name'], quote=True)}'{selected} "
+                            f"data-next='{html_escape(p['next_ip'], quote=True)}'>"
+                            f"{html_escape(p['name'])} ({html_escape(p['network'])})</option>")
+            if pool_name not in pool_names:
+                options = (f"<option value='{html_escape(pool_name, quote=True)}' selected>"
+                           f"{html_escape(pool_name)} (missing)</option>") + options
 
             rows_html += f"""
-            <tr>
+            <tr data-device="{html_escape(mac, quote=True)}">
                 <td>{total - idx + 1}</td>
-                <td><strong>{html_escape(r.get('assigned_hostname', ''))}</strong></td>
-                <td><code>{html_escape(r.get('assigned_ip', ''))}</code></td>
+                <td><strong>{html_escape(hostname)}</strong>{pin_badges}</td>
+                <td><code>{html_escape(ip)}</code></td>
                 <td>{pool_badge}</td>
-                <td><code class='text-muted'>{html_escape(r.get('mac', ''))}</code></td>
+                <td><code class='text-muted'>{html_escape(mac)}</code></td>
                 <td>{html_escape(r.get('serial', ''))}</td>
                 <td>{html_escape(r.get('model', ''))}</td>
                 <td>{key_badge}</td>
                 <td><small>{html_escape(r.get('key_source', ''))}</small></td>
                 <td><span class='badge {status_cls}'>{html_escape(status)}</span></td>
                 <td><small>{html_escape(r.get('timestamp', ''))}</small></td>
-                <td>
-                    <div class="input-group input-group-sm">
-                        <select class="form-select form-select-sm reassign-pool" data-mac="{html_escape(r.get('mac', ''), quote=True)}" style="max-width:150px;">
-                            {row_pool_options}
-                        </select>
-                        <button class="btn btn-outline-warning btn-sm reassign-btn" data-mac="{html_escape(r.get('mac', ''), quote=True)}" title="Reassign to selected pool">&#8635;</button>
+                <td class="text-nowrap">
+                    <button class="btn btn-outline-primary btn-sm edit-device-btn"
+                            data-mac="{html_escape(mac, quote=True)}">Edit name / IP</button>
+                </td>
+            </tr>
+            <tr class="editor-row d-none" data-editor="{html_escape(mac, quote=True)}">
+                <td colspan="12">
+                    <div class="row g-2 align-items-end">
+                        <div class="col-md-3">
+                            <label class="form-label small text-muted mb-0">Computer name (hostname)</label>
+                            <input type="text" class="form-control form-control-sm" data-f="hostname"
+                                   value="{html_escape(hostname, quote=True)}" placeholder="nuc-101">
+                            <label class="form-check-label small text-muted mt-1">
+                                <input class="form-check-input me-1" type="checkbox" data-f="auto_hostname">
+                                auto name from the pool prefix
+                            </label>
+                        </div>
+                        <div class="col-md-3">
+                            <label class="form-label small text-muted mb-0">IP address</label>
+                            <input type="text" class="form-control form-control-sm" data-f="ip"
+                                   value="{html_escape(ip, quote=True)}" placeholder="192.168.1.140">
+                            <label class="form-check-label small text-muted mt-1">
+                                <input class="form-check-input me-1" type="checkbox" data-f="auto_ip">
+                                give the next free IP of the pool
+                            </label>
+                        </div>
+                        <div class="col-md-2">
+                            <label class="form-label small text-muted mb-0">Pool</label>
+                            <select class="form-select form-select-sm" data-f="pool">{options}</select>
+                            <small class="text-muted pool-next">next free: -</small>
+                        </div>
+                        <div class="col-md-4 text-md-end">
+                            <button class="btn btn-primary btn-sm" data-act="save-identity">Save name / IP</button>
+                            <button class="btn btn-outline-secondary btn-sm" data-act="auto-identity"
+                                    title="Reassign the next free address of the selected pool and let the name follow it">Reset to auto</button>
+                            <button class="btn btn-outline-dark btn-sm" data-act="cancel-edit">Cancel</button>
+                            <div class="small identity-msg mt-1"></div>
+                        </div>
                     </div>
                 </td>
             </tr>
             """
+        if not rows_html:
+            rows_html = ("<tr><td colspan='12' class='text-center py-4 text-muted'>"
+                         "No devices connected yet. Start PXE booting your NUCs!</td></tr>")
+        return rows_html
+
+    def render_dashboard(self):
+        with DATA_LOCK:
+            records = list(inventory_mgr.records.values())
+            pools_data = self.pools_payload()
+            settings = dict(inventory_mgr.settings)
+            predefined = inventory_mgr.predefined_payload()
+
+        stats = self.dashboard_stats(records)
+        total, target = stats["total"], stats["target"]
+        keys_found, completed = stats["keys_found"], stats["completed"]
+
+        pool_cards_html = self.render_pool_cards(pools_data)
+        rows_html = self.render_device_rows(records, pools_data)
+        predefined_rows = self.render_predefined_rows(predefined)
 
         read_only = inventory_mgr.read_only
         banner = ("""
@@ -1231,9 +1747,12 @@ class DeploymentRequestHandler(SimpleHTTPRequestHandler):
                     ({target} Target Units)</p>
             </div>
             <div class="text-end">
-                <span id="refresh-state" class="badge bg-light text-dark border me-2">live</span>
-                <a href="/export.csv" class="btn btn-outline-primary btn-sm me-2">Download CSV</a>
-                <button onclick="location.reload()" class="btn btn-secondary btn-sm">Refresh</button>
+                <span id="refresh-state" class="badge bg-light text-dark border me-2">auto-refresh off</span>
+                <button id="auto-refresh-toggle" class="btn btn-outline-secondary btn-sm me-2"
+                        title="Auto-refresh is OFF by default. Turn it on to poll the server every 5s - only the tables below are updated, the page is never reloaded.">
+                    Auto-refresh: off</button>
+                <button id="refresh-now" class="btn btn-secondary btn-sm me-2">Refresh</button>
+                <a href="/export.csv" class="btn btn-outline-primary btn-sm">Download CSV</a>
             </div>
         </div>
 
@@ -1243,35 +1762,35 @@ class DeploymentRequestHandler(SimpleHTTPRequestHandler):
             <div class="col-md-3">
                 <div class="card stat-card bg-white p-3">
                     <span class="text-muted small text-uppercase fw-semibold">Total Registered</span>
-                    <h3 class="display-6 fw-bold my-1 text-primary">{total} <small class="text-muted fs-6">/ {target}</small></h3>
+                    <h3 class="display-6 fw-bold my-1 text-primary"><span id="stat-total">{total}</span> <small class="text-muted fs-6">/ <span id="stat-target">{target}</span></small></h3>
                     <div class="progress mt-2" style="height: 6px;">
-                        <div class="progress-bar bg-primary" style="width: {(total/max(target,1))*100}%"></div>
+                        <div id="stat-bar-total" class="progress-bar bg-primary" style="width: {stats['progress_total']}%"></div>
                     </div>
                 </div>
             </div>
             <div class="col-md-3">
                 <div class="card stat-card bg-white p-3">
                     <span class="text-muted small text-uppercase fw-semibold">Windows Keys Saved</span>
-                    <h3 class="display-6 fw-bold my-1 text-success">{keys_found}</h3>
+                    <h3 class="display-6 fw-bold my-1 text-success" id="stat-keys">{keys_found}</h3>
                     <div class="progress mt-2" style="height: 6px;">
-                        <div class="progress-bar bg-success" style="width: {(keys_found/max(total, 1))*100}%"></div>
+                        <div id="stat-bar-keys" class="progress-bar bg-success" style="width: {stats['progress_keys']}%"></div>
                     </div>
                 </div>
             </div>
             <div class="col-md-3">
                 <div class="card stat-card bg-white p-3">
                     <span class="text-muted small text-uppercase fw-semibold">Completed / Configured</span>
-                    <h3 class="display-6 fw-bold my-1 text-info">{completed}</h3>
+                    <h3 class="display-6 fw-bold my-1 text-info" id="stat-completed">{completed}</h3>
                     <div class="progress mt-2" style="height: 6px;">
-                        <div class="progress-bar bg-info" style="width: {(completed/max(total, 1))*100}%"></div>
+                        <div id="stat-bar-completed" class="progress-bar bg-info" style="width: {stats['progress_completed']}%"></div>
                     </div>
                 </div>
             </div>
             <div class="col-md-3">
                 <div class="card stat-card bg-white p-3">
                     <span class="text-muted small text-uppercase fw-semibold">Subnet Pools Active</span>
-                    <h3 class="display-6 fw-bold my-1 text-dark">{len(pools_data)}</h3>
-                    <small class="text-muted">Default pool: <strong>{html_escape(settings.get('default_pool', 'default'))}</strong></small>
+                    <h3 class="display-6 fw-bold my-1 text-dark" id="stat-pools">{len(pools_data)}</h3>
+                    <small class="text-muted">Default pool: <strong id="stat-default-pool">{html_escape(settings.get('default_pool', 'default'))}</strong></small>
                 </div>
             </div>
         </div>
@@ -1360,16 +1879,25 @@ class DeploymentRequestHandler(SimpleHTTPRequestHandler):
                 <h5 class="mb-0 fw-semibold">Subnet Pools Overview</h5>
             </div>
             <div class="card-body">
-                <div class="row g-3">
-                    {pool_cards_html or '<div class="col-12 text-muted">No pools configured.</div>'}
+                <div class="row g-3" id="pool-cards">
+                    {pool_cards_html}
                 </div>
             </div>
         </div>
 
         <div class="card stat-card bg-white">
             <div class="card-header bg-white py-3 border-bottom d-flex justify-content-between align-items-center">
-                <h5 class="mb-0 fw-semibold">Connected NUC Systems</h5>
-                <span class="badge bg-light text-dark border">auto-refresh every 5s (paused while editing)</span>
+                <div>
+                    <h5 class="mb-0 fw-semibold">Connected NUC Systems</h5>
+                    <small class="text-muted">
+                        <strong>Edit name / IP</strong> pins an exact address and/or a custom computer name to
+                        one unit - it is applied by the post-run hook and survives a restart.
+                    </small>
+                </div>
+                <div class="text-end">
+                    <span class="badge bg-light text-dark border" id="last-updated">not refreshed yet</span>
+                    <div class="small" id="device-msg"></div>
+                </div>
             </div>
             <div class="table-responsive">
                 <table class="table table-hover align-middle mb-0">
@@ -1386,13 +1914,54 @@ class DeploymentRequestHandler(SimpleHTTPRequestHandler):
                             <th>Key Source</th>
                             <th>Status</th>
                             <th>Timestamp</th>
-                            <th>Reassign</th>
+                            <th>Name / IP</th>
                         </tr>
                     </thead>
-                    <tbody>
-                        {rows_html if rows_html else "<tr><td colspan='12' class='text-center py-4 text-muted'>No devices connected yet. Start PXE booting your NUCs!</td></tr>"}
+                    <tbody id="device-rows">
+                        {rows_html}
                     </tbody>
                 </table>
+            </div>
+        </div>
+
+        <!-- ============ Fixed IP / name pre-assignments (ip_pool.csv) ============ -->
+        <div class="card stat-card bg-white mt-4">
+            <div class="card-header bg-white py-3 border-bottom">
+                <h5 class="mb-0 fw-semibold">Fixed IP &amp; name per unit (MAC pre-assignments)</h5>
+                <small class="text-muted">
+                    Reserve an exact IP + computer name for a NUC <em>before</em> it boots. A MAC listed here
+                    always receives that address and name, and the pool allocator skips the address.
+                    Saved to <code>{html_escape(os.path.basename(inventory_mgr.pool_csv or 'ip_pool.csv'))}</code>.
+                </small>
+            </div>
+            <div class="card-body">
+                <div class="table-responsive">
+                    <table class="table table-sm align-middle mb-2 fixed-table">
+                        <thead class="table-light">
+                            <tr>
+                                <th>MAC address</th>
+                                <th>Fixed IP</th>
+                                <th>Computer name</th>
+                                <th>Pool / gateway</th>
+                                <th class="text-end">Actions</th>
+                            </tr>
+                        </thead>
+                        <tbody id="predefined-rows">{predefined_rows}</tbody>
+                        <tfoot>
+                            <tr>
+                                <td><input class="form-control form-control-sm" id="pre-mac" placeholder="aa:bb:cc:dd:ee:ff"></td>
+                                <td><input class="form-control form-control-sm" id="pre-ip" placeholder="192.168.1.140"></td>
+                                <td><input class="form-control form-control-sm" id="pre-host" placeholder="workshop-01"></td>
+                                <td class="text-muted small">the IP must be inside one of the pool subnets</td>
+                                <td class="text-end">
+                                    <button class="btn btn-outline-primary btn-sm" id="pre-save" {'disabled' if read_only else ''}>
+                                        Add / update</button>
+                                </td>
+                            </tr>
+                        </tfoot>
+                    </table>
+                </div>
+                <div id="pre-msg" class="small"></div>
             </div>
         </div>
     </div>
@@ -1407,7 +1976,7 @@ class DeploymentRequestHandler(SimpleHTTPRequestHandler):
 DASHBOARD_CSS = """
         body { background-color: #f8f9fa; font-family: system-ui, -apple-system, sans-serif; }
         .stat-card { border-radius: 10px; border: none; box-shadow: 0 2px 8px rgba(0,0,0,0.06); }
-        .reassign-btn { font-size: 0.75rem; }
+        .edit-device-btn, .pre-delete { font-size: 0.72rem; white-space: nowrap; }
         .pool-table input, .pool-table select { font-size: .8rem; }
         .pool-table input { border-color: #e3e6ea; padding: .2rem .4rem; width: 100%; min-width: 74px; }
         .pool-table input:focus { border-color: #86b7fe; box-shadow: none; }
@@ -1417,15 +1986,24 @@ DASHBOARD_CSS = """
         .pool-row-actions { white-space: nowrap; text-align: right; }
         .pool-row-actions .btn { font-size: .72rem; padding: .15rem .4rem; }
         .exhausted { color: #dc3545 !important; }
+        /* per-device name / IP editor */
+        .editor-row > td { background: #f1f5f9 !important; border-top: 2px solid #dee2e6 !important; }
+        .editor-row .form-check-label { font-size: .72rem; }
+        .editor-row input[disabled] { background: #eceff3; }
+        .identity-msg { min-height: 1em; }
+        .fixed-table input, .fixed-table td { font-size: .8rem; }
+        .fixed-table code { font-size: .78rem; }
 """
 
 DASHBOARD_JS = """
 (function () {
-    var REFRESH_MS = 5000;               // dashboard auto-refresh
-    var EDIT_GRACE_MS = 90000;           // resume refreshing after 90s of inactivity
+    var REFRESH_MS = 5000;               // poll interval while auto-refresh is ON
+    var AUTO_KEY = 'mgw.autoRefresh';    // remembers the on/off choice in this browser
+    var EDIT_GRACE_MS = 90000;           // after this long an untouched field stops blocking the refresh
     var READ_ONLY = false;
     var editing = false;
     var editingSince = 0;
+    var autoRefresh = false;
     var FIELDS = ['name', 'network', 'start', 'max', 'next_ip', 'gateway', 'dns', 'prefix'];
 
     function $(id) { return document.getElementById(id); }
@@ -1434,17 +2012,23 @@ DASHBOARD_JS = """
             .replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;')
             .replace(/"/g, '&quot;').replace(/'/g, '&#39;');
     }
-    function setEditing(on) {
-        editing = on;
-        if (on) editingSince = Date.now();
-        var badge = $('refresh-state');
-        if (badge) {
-            badge.textContent = on ? 'editing - auto-refresh paused' : 'live';
-            badge.className = on ? 'badge bg-warning text-dark me-2' : 'badge bg-light text-dark border me-2';
-        }
-    }
+    function setText(id, v) { var el = $(id); if (el) el.textContent = v; }
+    function setWidth(id, pct) { var el = $(id); if (el) el.style.width = pct + '%'; }
+
     function msg(text, ok) {
         var el = $('config-msg');
+        if (!el) return;
+        el.textContent = text || '';
+        el.className = 'small ' + (ok === false ? 'text-danger' : 'text-success');
+    }
+    function deviceMsg(text, ok) {
+        var el = $('device-msg');
+        if (!el) return;
+        el.textContent = text || '';
+        el.className = 'small ' + (ok === false ? 'text-danger' : 'text-success');
+    }
+    function preMsg(text, ok) {
+        var el = $('pre-msg');
         if (!el) return;
         el.textContent = text || '';
         el.className = 'small ' + (ok === false ? 'text-danger' : 'text-success');
@@ -1461,6 +2045,88 @@ DASHBOARD_JS = """
         });
     }
 
+    // ======================================================= auto-refresh control
+    function readAutoRefreshPreference() {
+        var m = location.search.match(/[?&]refresh=([^&]*)/);
+        if (m) return /^(1|on|yes|true|enabled?)$/i.test(decodeURIComponent(m[1]));
+        try { return localStorage.getItem(AUTO_KEY) === 'on'; } catch (e) { return false; }
+    }
+    function renderAutoRefresh() {
+        var btn = $('auto-refresh-toggle');
+        if (btn) {
+            btn.textContent = 'Auto-refresh: ' + (autoRefresh ? 'on (5s)' : 'off');
+            btn.className = (autoRefresh ? 'btn btn-success btn-sm me-2'
+                                         : 'btn btn-outline-secondary btn-sm me-2');
+        }
+        var badge = $('refresh-state');
+        if (badge) {
+            badge.textContent = autoRefresh
+                ? (editing ? 'auto-refresh on - paused while you type' : 'auto-refresh on')
+                : 'auto-refresh off';
+            badge.className = autoRefresh ? 'badge bg-success me-2'
+                                          : 'badge bg-light text-dark border me-2';
+        }
+    }
+    function setAutoRefresh(on) {
+        autoRefresh = !!on;
+        try { localStorage.setItem(AUTO_KEY, autoRefresh ? 'on' : 'off'); } catch (e) {}
+        renderAutoRefresh();
+        if (!autoRefresh) deviceMsg('auto-refresh off - press "Refresh" to update the tables', true);
+        else refreshLive();
+    }
+    function setEditing(on) {
+        editing = on;
+        if (on) editingSince = Date.now();
+        renderAutoRefresh();
+    }
+
+    // ========================================================= live table updates
+    function applyStats(s) {
+        if (!s) return;
+        setText('stat-total', s.total);
+        setText('stat-target', s.target);
+        setText('stat-keys', s.keys_found);
+        setText('stat-completed', s.completed);
+        setText('stat-pools', s.pools);
+        setText('stat-default-pool', s.default_pool);
+        setWidth('stat-bar-total', s.progress_total);
+        setWidth('stat-bar-keys', s.progress_keys);
+        setWidth('stat-bar-completed', s.progress_completed);
+    }
+
+    /* Refresh the numbers, the pool cards and the NUC table *in place* - the page is
+       never reloaded, so the settings panel you are editing stays exactly as it is. */
+    function refreshLive() {
+        return api('/api/dashboard').then(function (d) {
+            applyStats(d.stats);
+            if (typeof d.pool_cards === 'string') $('pool-cards').innerHTML = d.pool_cards;
+            if (typeof d.rows === 'string') $('device-rows').innerHTML = d.rows;
+            if (typeof d.predefined_rows === 'string') $('predefined-rows').innerHTML = d.predefined_rows;
+            setText('last-updated', 'refreshed ' + new Date().toLocaleTimeString());
+            return d;
+        }).catch(function (e) {
+            setText('last-updated', 'refresh failed');
+            throw e;
+        });
+    }
+
+    function openEditorRow() {
+        var rows = document.querySelectorAll('#device-rows .editor-row');
+        for (var i = 0; i < rows.length; i++) {
+            if (!rows[i].classList.contains('d-none')) return rows[i];
+        }
+        return null;
+    }
+    /* True while a refresh would destroy something the technician is working on. */
+    function busy() {
+        if (openEditorRow()) return true;
+        var el = document.activeElement;
+        if (el && el.closest && el.closest('#network-settings, #device-rows')) return true;
+        if (editing && (Date.now() - editingSince) < EDIT_GRACE_MS) return true;
+        return false;
+    }
+
+    // ============================================================ subnet pool rows
     function cellHtml(field, p) {
         var type = (field === 'start' || field === 'max') ? 'number' : 'text';
         var val = p[field];
@@ -1529,7 +2195,7 @@ DASHBOARD_JS = """
         $('set-server-ip').value = cfg.settings.server_ip || '';
         $('set-port').value = cfg.settings.port || '';
         $('set-target').value = cfg.settings.target_count || '';
-        ['set-server-ip', 'set-port', 'set-target', 'save-settings'].forEach(function (id) {
+        ['set-server-ip', 'set-port', 'set-target', 'save-settings', 'pre-save'].forEach(function (id) {
             if ($(id)) $(id).disabled = READ_ONLY;
         });
         $('pool-rows').innerHTML = cfg.pools.map(function (p) { return row(p, false); }).join('');
@@ -1550,7 +2216,7 @@ DASHBOARD_JS = """
                     $('hook-prerun').value = h.prerun;
                     $('hook-postrun').value = h.postrun;
                 });
-            }).catch(function () {});
+            }).then(function () { return refreshLive(); }).catch(function () {});
         };
     }
 
@@ -1583,10 +2249,123 @@ DASHBOARD_JS = """
             .catch(function (e) { msg(e.message, false); });
     }
 
+    // ==================================================== per-device name / IP editor
+    function editorFor(mac) {
+        return document.querySelector('#device-rows .editor-row[data-editor="' + mac + '"]');
+    }
+    function editorButton(mac) {
+        return document.querySelector('#device-rows .edit-device-btn[data-mac="' + mac + '"]');
+    }
+    function closeEditors() {
+        document.querySelectorAll('#device-rows .editor-row').forEach(function (r) {
+            r.classList.add('d-none');
+        });
+        document.querySelectorAll('#device-rows .edit-device-btn').forEach(function (b) {
+            b.textContent = 'Edit name / IP';
+        });
+    }
+    function syncEditorInputs(row) {
+        var autoName = row.querySelector('[data-f="auto_hostname"]');
+        var autoIp = row.querySelector('[data-f="auto_ip"]');
+        var nameEl = row.querySelector('[data-f="hostname"]');
+        var ipEl = row.querySelector('[data-f="ip"]');
+        nameEl.disabled = autoName.checked;
+        ipEl.disabled = autoIp.checked;
+        updatePoolNext(row);
+    }
+    function updatePoolNext(row) {
+        var sel = row.querySelector('[data-f="pool"]');
+        var hint = row.querySelector('.pool-next');
+        if (!sel || !hint || !sel.options.length) return;
+        var next = sel.options[sel.selectedIndex].getAttribute('data-next');
+        hint.textContent = next ? ('next free: ' + next) : 'next free: -';
+    }
+    function toggleEditor(mac) {
+        var row = editorFor(mac);
+        var btn = editorButton(mac);
+        if (!row) return;
+        var wasHidden = row.classList.contains('d-none');
+        closeEditors();
+        if (wasHidden) {
+            row.classList.remove('d-none');
+            if (btn) btn.textContent = 'Close editor';
+            syncEditorInputs(row);
+            var note = row.querySelector('.identity-msg');
+            if (note) { note.textContent = ''; note.className = 'small identity-msg'; }
+            row.querySelector('[data-f="hostname"]').focus();
+        }
+    }
+    function collectIdentity(row) {
+        var autoName = row.querySelector('[data-f="auto_hostname"]').checked;
+        var autoIp = row.querySelector('[data-f="auto_ip"]').checked;
+        var sel = row.querySelector('[data-f="pool"]');
+        return {
+            mac: row.getAttribute('data-editor'),
+            auto_hostname: autoName,
+            hostname: autoName ? '' : row.querySelector('[data-f="hostname"]').value.trim(),
+            auto_ip: autoIp,
+            ip: autoIp ? '' : row.querySelector('[data-f="ip"]').value.trim(),
+            pool: sel ? sel.value : ''
+        };
+    }
+    function saveIdentity(row) {
+        var payload = collectIdentity(row);
+        var note = row.querySelector('.identity-msg');
+        if (note) { note.textContent = 'saving...'; note.className = 'small identity-msg text-muted'; }
+        api('/api/device/update', payload).then(function (d) {
+            var text = 'saved: ' + d.assigned_hostname + ' / ' + d.assigned_ip + ' (pool ' + d.pool + ')' +
+                       (d.notes && d.notes.length ? ' - ' + d.notes.join(', ') : '');
+            closeEditors();
+            deviceMsg(text + ' \u2713', true);
+            setEditing(false);
+            return refreshLive();
+        }).catch(function (e) {
+            if (note) { note.textContent = e.message; note.className = 'small identity-msg text-danger'; }
+            deviceMsg('not saved: ' + e.message, false);
+        });
+    }
+    function autoIdentity(row) {
+        var sel = row.querySelector('[data-f="pool"]');
+        var pool = sel ? sel.value : '';
+        if (!confirm('Give this unit the next free IP of pool "' + pool + '" and let its computer name ' +
+                     'follow the pool prefix?')) return;
+        row.querySelector('[data-f="auto_hostname"]').checked = true;
+        row.querySelector('[data-f="auto_ip"]').checked = true;
+        syncEditorInputs(row);
+        saveIdentity(row);
+    }
+
+    // ==================================================== MAC pre-assignments table
+    function savePredefined() {
+        var mac = $('pre-mac').value.trim();
+        var ip = $('pre-ip').value.trim();
+        var host = $('pre-host').value.trim();
+        if (!mac || !ip) { preMsg('a MAC address and a fixed IP are both required', false); return; }
+        api('/api/predefine/save', {mac: mac, ip: ip, hostname: host}).then(function (d) {
+            preMsg('reserved ' + d.ip + (d.hostname ? ' / ' + d.hostname : '') +
+                   (d.pool ? ' in pool ' + d.pool : '') +
+                   (d.notes && d.notes.length ? ' (' + d.notes.join(', ') + ')' : '') +
+                   (d.persisted ? ' \u2713 (saved)' : ' \u2713 (not persisted - server runs with --no-config)'),
+                   true);
+            $('pre-mac').value = '';
+            $('pre-ip').value = '';
+            $('pre-host').value = '';
+            return refreshLive();
+        }).catch(function (e) { preMsg(e.message, false); });
+    }
+    function removePredefined(mac) {
+        if (!confirm('Remove the fixed IP / name reservation for ' + mac + '?')) return;
+        api('/api/predefine/delete', {mac: mac}).then(function () {
+            preMsg('reservation for ' + mac + ' removed \u2713', true);
+            return refreshLive();
+        }).catch(function (e) { preMsg(e.message, false); });
+    }
+
+    // ================================================================== wiring up
     var panel = $('network-settings');
     panel.addEventListener('click', function (ev) {
         var btn = ev.target.closest ? ev.target.closest('[data-act]') : null;
-        if (!btn) return;
+        if (!btn || btn.closest('#device-rows')) return;
         var tr = btn.closest('tr');
         if (tr) handle(btn.getAttribute('data-act'), tr);
     });
@@ -1594,7 +2373,43 @@ DASHBOARD_JS = """
         if (ev.target.matches && ev.target.matches('input,select,textarea')) setEditing(true);
     });
     panel.addEventListener('input', function () { setEditing(true); });
-    document.addEventListener('keydown', function (e) { if (e.key === 'Escape') setEditing(false); });
+
+    // The NUC table is re-rendered on every refresh, so its buttons are delegated.
+    document.addEventListener('click', function (ev) {
+        var t = ev.target;
+        if (!t || !t.closest) return;
+        var editBtn = t.closest('.edit-device-btn');
+        if (editBtn) { toggleEditor(editBtn.getAttribute('data-mac')); return; }
+        var act = t.closest('#device-rows [data-act]');
+        if (act) {
+            var row = act.closest('.editor-row');
+            var which = act.getAttribute('data-act');
+            if (which === 'save-identity') saveIdentity(row);
+            else if (which === 'auto-identity') autoIdentity(row);
+            else if (which === 'cancel-edit') closeEditors();
+            return;
+        }
+        var del = t.closest('.pre-delete');
+        if (del) { removePredefined(del.getAttribute('data-mac')); return; }
+    });
+    document.addEventListener('change', function (ev) {
+        var row = ev.target.closest ? ev.target.closest('#device-rows .editor-row') : null;
+        var field = ev.target.getAttribute ? ev.target.getAttribute('data-f') : null;
+        if (row && (field === 'auto_hostname' || field === 'auto_ip' || field === 'pool')) {
+            syncEditorInputs(row);
+        }
+    });
+    document.addEventListener('keydown', function (ev) {
+        if (ev.key === 'Escape') {
+            closeEditors();
+            setEditing(false);
+            return;
+        }
+        if (ev.key === 'Enter' && ev.target.closest && ev.target.closest('#device-rows .editor-row')) {
+            ev.preventDefault();
+            saveIdentity(ev.target.closest('.editor-row'));
+        }
+    });
 
     $('save-settings').addEventListener('click', function () {
         api('/api/config/save', {
@@ -1604,6 +2419,16 @@ DASHBOARD_JS = """
         }).then(afterWrite('global settings saved')).catch(function (e) { msg(e.message, false); });
     });
     $('reload-config').addEventListener('click', function () { setEditing(false); load(); msg('reloaded'); });
+
+    $('auto-refresh-toggle').addEventListener('click', function () { setAutoRefresh(!autoRefresh); });
+    $('refresh-now').addEventListener('click', function () {
+        refreshLive().then(function () { deviceMsg('tables refreshed \u2713', true); })
+                     .catch(function (e) { deviceMsg('refresh failed: ' + e.message, false); });
+    });
+    $('pre-save').addEventListener('click', savePredefined);
+    ['pre-mac', 'pre-ip', 'pre-host'].forEach(function (id) {
+        $(id).addEventListener('keydown', function (ev) { if (ev.key === 'Enter') { ev.preventDefault(); savePredefined(); } });
+    });
 
     document.querySelectorAll('.copy-btn').forEach(function (btn) {
         btn.addEventListener('click', function () {
@@ -1615,36 +2440,23 @@ DASHBOARD_JS = """
         });
     });
 
-    document.querySelectorAll('.reassign-btn').forEach(function (btn) {
-        btn.addEventListener('click', function () {
-            var mac = this.getAttribute('data-mac');
-            var select = document.querySelector('.reassign-pool[data-mac="' + mac + '"]');
-            var pool = select ? select.value : '';
-            if (!pool) { alert('Select a target pool first.'); return; }
-            if (!confirm('Reassign ' + mac + ' to pool "' + pool + '" (new IP)?')) return;
-            api('/api/reassign', {mac: mac, pool: pool})
-                .then(function (d) { alert('Reassigned to ' + d.assigned_ip + ' (pool: ' + d.pool + ')'); location.reload(); })
-                .catch(function (e) { alert('Error: ' + e); });
-        });
-    });
-
     function load() {
         api('/api/config').then(render).catch(function (e) { msg('config load failed: ' + e.message, false); });
         api('/api/hooks').then(function (h) {
             $('hook-prerun').value = h.prerun;
             $('hook-postrun').value = h.postrun;
         }).catch(function () {});
+        refreshLive().catch(function () {});
     }
+
+    autoRefresh = readAutoRefreshPreference();   // OFF unless it was switched on before
+    renderAutoRefresh();
     load();
 
     setInterval(function () {
-        if (editing) {
-            var focused = document.activeElement;
-            var stillTyping = focused && focused.closest && focused.closest('#pool-rows input, #network-settings input');
-            if (stillTyping || (Date.now() - editingSince) < EDIT_GRACE_MS) return;
-            setEditing(false);
-        }
-        location.reload();
+        if (editing && (Date.now() - editingSince) > EDIT_GRACE_MS) setEditing(false);
+        if (!autoRefresh || busy()) return;
+        refreshLive().catch(function () {});
     }, REFRESH_MS);
 })();
 """
