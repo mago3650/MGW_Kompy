@@ -66,20 +66,79 @@ method=ignore
 
 ## IP Allocation Modes
 
-### Mode 1: Automatic Sequential Allocation (Default)
+### Mode 1: Multiple Subnet Pools (Recommended)
+The server supports **multiple subnet pools**, so you can assign different IP ranges to different batches or locations:
+
+```bash
+python3 server/inventory_server.py \
+    --subnet 192.168.100 \
+    --start-ip 1 \
+    --gateway 192.168.100.1 \
+    --subnet-pool "name=office,subnet=10.10.35,start=1,max=250,gw=10.10.35.1,mask=255.255.255.0,cidr=24,dns=1.1.1.1,prefix=off-" \
+    --subnet-pool "name=depot,subnet=10.30.1,start=1,max=250,gw=10.30.1.1,mask=255.255.255.0,cidr=24,dns=8.8.8.8,prefix=dep-"
+```
+
+Or via `run_server.sh` — uncomment and edit the `EXTRA_POOLS` array:
+
+```bash
+EXTRA_POOLS=(
+    "name=office,subnet=10.10.35,start=1,max=250,gw=10.10.35.1,mask=255.255.255.0,cidr=24,dns=1.1.1.1,prefix=off-"
+    "name=depot,subnet=10.30.1,start=1,max=250,gw=10.30.1.1,mask=255.255.255.0,cidr=24,dns=8.8.8.8,prefix=dep-"
+)
+```
+
+Each pool has its own:
+- **Subnet range** (e.g. `10.10.35.x`, `10.30.1.x`)
+- **IP range** (`start` to `max`)
+- **Gateway, netmask, CIDR, DNS**
+- **Hostname prefix** (e.g. `off-001`, `dep-001`)
+
+The **default pool** is configured via `--subnet`, `--start-ip`, `--gateway`, etc. Devices that don't specify a pool get assigned from it.
+
+**Choosing a pool:** Devices can specify which pool to use by sending `"pool": "office"` in their registration request, or you can reassign them via the Web Dashboard or the `/api/reassign` API endpoint.
+
+**Dashboard:** The web UI shows all active pools, their usage, and provides a dropdown to reassign any device to a different pool with a new IP.
+
+### Mode 2: Automatic Sequential Allocation (Single Pool)
 No prior configuration required. The server allocates sequential IPs starting from `--start-ip` (default: 101):
 - First NUC connected: `192.168.1.101` (`nuc-101`)
 - Second NUC connected: `192.168.1.102` (`nuc-102`)
 - ...
 - 150th NUC connected: `192.168.1.250` (`nuc-250`)
 
-### Mode 2: Pre-defined MAC Mapping Table (`ip_pool.csv`)
+### Mode 3: Pre-defined MAC Mapping Table (`ip_pool.csv`)
 If your organization requires specific IP addresses bound to specific physical locations or MAC addresses, edit `server/ip_pool.csv`:
 
 ```csv
 mac,ip,hostname,gateway,netmask,dns
-00:1a:2b:3c:4d:01,10.0.50.101,lab-nuc-01,10.0.50.1,255.255.255.0,10.0.50.2,1.1.1.1
-00:1a:2b:3c:4d:02,10.0.50.102,lab-nuc-02,10.0.50.1,255.255.255.0,10.0.50.2,1.1.1.1
+00:1a:2b:3c:4d:01,10.0.50.101,lab-nuc-01,10.0.50.1,255.255.255.0,1.1.1.1
+00:1a:2b:3c:4d:02,192.168.100.50,nuc-lab01,192.168.100.1,255.255.255.0,1.1.1.1
+00:1a:2b:3c:4d:03,10.10.35.10,nuc-office01,10.10.35.1,255.255.255.0,1.1.1.1
 ```
 
-If a MAC is found in this file, the server returns that explicit assignment. If a MAC is not found, it gracefully falls back to dynamic sequential allocation.
+You can mix subnets here freely — each row can use a completely different network. If a MAC is found in this file, the server returns that explicit assignment. If a MAC is not found, it gracefully falls back to dynamic sequential allocation from the selected pool.
+
+---
+
+## API Reference: Subnet Pools
+
+### `GET /api/pools`
+Returns all configured subnet pools with their status:
+```json
+[
+  {"name": "default", "subnet": "192.168.100", "next_ip": "192.168.100.10", "available": 41, ...},
+  {"name": "office",  "subnet": "10.10.35",     "next_ip": "10.10.35.1",   "available": 100, ...}
+]
+```
+
+### `POST /api/reassign`
+Move a device to a different pool (assigns a new IP from that pool):
+```json
+{"mac": "aa:bb:cc:dd:ee:01", "pool": "office"}
+```
+
+### `POST /api/register`
+Register a device; optionally specify which pool:
+```json
+{"mac": "aa:bb:cc:dd:ee:02", "serial": "SN002", "pool": "depot", ...}
+```
