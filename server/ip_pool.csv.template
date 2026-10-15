@@ -1,7 +1,12 @@
 # MAC-to-IP Predefined Allocation Table (Optional)
 # If a MAC address is not listed here, the server will automatically assign
-# the next sequential IP from the subnet (e.g. 192.168.1.101, 102, ...).
+# the next sequential IP from the selected subnet pool.
+#
+# You can assign IPs from ANY subnet here (192.168.100.x, 10.10.35.x, etc.)
+# by specifying the full IP and its matching gateway/netmask.
 #
 mac,ip,hostname,gateway,netmask,dns
 00:1a:2b:3c:4d:01,192.168.1.101,nuc-001,192.168.1.1,255.255.255.0,1.1.1.1,8.8.8.8
-00:1a:2b:3c:4d:02,192.168.1.102,nuc-002,192.168.1.1,255.255.255.0,1.1.1.1,8.8.8.8
+00:1a:2b:3c:4d:02,192.168.100.50,nuc-lab01,192.168.100.1,255.255.255.0,1.1.1.1,8.8.8.8
+00:1a:2b:3c:4d:03,10.10.35.10,nuc-office01,10.10.35.1,255.255.255.0,1.1.1.1,8.8.8.8
+00:1a:2b:3c:4d:04,10.30.1.25,nuc-deploy01,10.30.1.1,255.255.255.0,8.8.8.8,1.1.1.1

@@ -72,6 +72,15 @@ On the Master PC:
 ```
 *(Or run `python3 server/inventory_server.py --port 8000 --subnet 192.168.100 --start-ip 101`)*
 
+**Multiple subnet pools** are supported for different network environments:
+```bash
+python3 server/inventory_server.py \
+    --subnet 192.168.100 --start-ip 1 --gateway 192.168.100.1 \
+    --subnet-pool "name=office,subnet=10.10.35,start=1,max=250,gw=10.10.35.1,prefix=off-" \
+    --subnet-pool "name=depot,subnet=10.30.1,start=1,max=250,gw=10.30.1.1,prefix=dep-"
+```
+Edit the `EXTRA_POOLS` array in `run_server.sh` or use `--subnet-pool` on the command line. Devices can be assigned to any pool or reassigned between pools via the Web Dashboard.
+
 Open your browser to: **`http://localhost:8000`** to view the live deployment dashboard.
 
 ### Step 3: Launch Clonezilla Lite Server (Multicast PXE)
