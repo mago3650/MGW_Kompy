@@ -5,6 +5,9 @@ Automated high-speed deployment pipeline for **150 Intel NUC computers**:
 - **Deploys Clonezilla Linux Image** to **20 computers simultaneously** via Multicast PXE over LAN (takes ~5–7 minutes per batch of 20).
 - **Assigns unique static IP addresses and hostnames** automatically to every machine - and lets you
   **pin an exact IP and a custom computer name to any single NUC** (before or after it boots).
+- **Stops DHCP from stealing that address.** The post-run hook neutralises netplan, systemd-networkd,
+  NetworkManager, ifupdown and cloud-init DHCP in the cloned image, and can install an on-boot agent
+  so a later dashboard edit lands at the next boot.
 - **Wipes `/etc/machine-id` and resets SSH keys** to eliminate network ID conflicts.
 - **Live Web Dashboard & CSV export** to monitor progress and archive license keys.
 
@@ -72,11 +75,18 @@ MGW_Kompy/
 ### Step 1: Equipment Setup
 1. Connect a **24-port Gigabit switch** to an isolated workbench (keep it disconnected from the corporate network so DHCP doesn't conflict).
 2. Connect your **Master / Technician PC** to the switch.
-3. Configure the Master PC with a static IP: `192.168.100.1 / 255.255.255.0`.
-   That address is also what you put in **Network Settings -> Master / server IP**, and the pool you
-   deploy into must be the same network (here: subnet `192.168.100.0/24`). The shipped seed is
-   `192.168.1.0/24`, so set it to `192.168.100.0/24` in the dashboard once - or start with
-   `--subnet 192.168.100.0/24 --start-ip 1 --gateway 192.168.100.1` for the first run only.
+3. Configure the Master PC with a **fixed** IP on the bench switch, and put that same address in
+   **Network Settings -> Master / server IP**. It is baked into every hook command, so a DHCP address
+   on the master will break the next batch the moment the lease changes. Give it a reservation on
+   the router, or set it statically and leave it alone.
+4. The deployment pool **must be the same network the master is actually on**. If the dashboard still
+   says `192.168.100.0/24` but `ip -4 addr` on the master shows `192.168.169.250/24`, the NUCs are
+   handed addresses that do not exist on the bench: they can never reach this server, and a name/IP
+   you change in the dashboard can never reach them. The server says so at startup and in a banner
+   (`Pool 'default' uses 192.168.100.0/24, but this PC is only on ...`). Press **Use this PC's network**
+   to rewrite the default pool, gateway and master IP from the address this PC really has.
+   The shipped seed is `192.168.1.0/24`; a first run can also be seeded with
+   `--subnet 192.168.169.0/24 --start-ip 101 --gateway 192.168.169.254 --server-ip 192.168.169.250`.
 
 ### Step 2: Start the Central Inventory Server
 On the Master PC:
@@ -101,6 +111,8 @@ detail is edited in the browser - no file editing, no restart, no re-deploy.
 | **Exact IP of one unit** | Same editor: type the address you want (`192.168.1.140`) - or tick *next free IP* to un-pin it again |
 | **Fixed IP + name per MAC** | "Fixed IP & name per unit": reserve an address *before* the NUC boots (saved to `ip_pool.csv`) |
 | Auto-refresh | **Off by default**; the *Auto-refresh* button polls the tables in place (no page reload) |
+| **Keep NUCs in sync on every boot** | On by default. Injected as `DEPLOY_BOOT_AGENT`; the post-run hook installs `mgw-identity.service` so a later rename/IP lands at the next boot |
+| **Use this PC's network** | Shown when a pool is not on this PC's network. Rewrites the default pool, gateway and master IP |
 
 Changes are validated (a malformed subnet, a bad gateway/DNS address, a duplicate pool name, an
 address outside the pool's own network are all rejected with a clear message; a next IP that is valid
@@ -158,13 +170,18 @@ in the URL forces it for one visit.
 
 Sanity-check the pool, naming and pinning logic without any hardware:
 ```bash
-python3 tests/test_network_config.py     # 19 checks, stdlib only (also runs under pytest)
+python3 tests/test_network_config.py     # 28 checks, stdlib only (also runs under pytest)
+python3 tests/test_configure_hook.py     # 6 hook checks: DHCP neutralisation, agent, idempotency
 ```
 
 ### Step 3: Launch Clonezilla Lite Server (Multicast PXE)
 1. Boot Clonezilla Live on your Master PC (or run it as a server).
 2. Select **`lite-server`** -> **`Start`** -> **`massive-deployment`**.
 3. Choose **`Use built-in DHCP service`**.
+   That DHCP server exists only for the PXE phase and stops afterwards. It does not keep handing
+   addresses out once the NUCs boot the restored image. FileZilla (if you use it to copy images) is
+   an FTP server: it has no DHCP and no IP pool. The address a deployed NUC keeps comes from the
+   image, which is why the post-run hook has to remove every DHCP source it finds.
 4. Select your Linux image from your storage device.
 5. Target disk: `nvme0n1` (or `sda`).
 6. Mode: **`multicast`** -> client wait: **`20`** (or wait-time: `180` seconds).
@@ -194,3 +211,17 @@ python3 tests/test_network_config.py     # 19 checks, stdlib only (also runs und
 - Connect the next batch of 20 units.
 - Repeat until all 150 units are deployed.
 - Download `nuc_inventory.csv` from the dashboard to keep the complete archive of all 150 Windows product keys and hardware serial numbers.
+
+### Before the first batch: take the NUC range off the router
+
+If the bench switch is still attached to a router, that router is a DHCP server of its own. Clonezilla's
+built-in DHCP only covers PXE. After imaging, a NUC left able to ask for DHCP will take whatever the
+router offers — often a `192.168.169.x` address that is not the one in the dashboard (the "weird IP").
+
+1. **Take the deployment range out of the router's DHCP pool** before you image (for a pool of
+   `192.168.169.101`–`192.168.169.250`, those addresses must not be free for the router to hand out),
+   **or isolate the bench switch** from the office LAN entirely.
+2. **Reserve the master PC's address** (or set it statically). It is written into every hook command.
+3. Watch the **Seen as** column. A green check means the unit checked in from its assigned address; a
+   red cross names the address it actually used. The banner names the unit. Details and the five DHCP
+   stacks the hook disables are in `docs/03_ip_and_network_config.md`.

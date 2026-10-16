@@ -432,6 +432,238 @@ def test_dashboard_ships_the_editors_and_auto_refresh_toggle_off():
         S.inventory_mgr = previous
 
 
+# ------------------------------------------------ bench network + seen address
+def test_checkin_records_the_address_it_really_came_from():
+    mgr = _manager(tempfile.mkdtemp())
+    resp, code = mgr.register_device({"mac": "aa:bb:cc:00:00:01"}, seen_ip="192.168.169.45")
+    assert code == 200, resp
+    rec = mgr.records["aa:bb:cc:00:00:01"]
+    assert rec["seen_ip"] == "192.168.169.45" and rec["seen_at"], rec
+    assert rec["assigned_ip"] == "192.168.1.101"
+
+    # a later check-in from the assigned address replaces the previous sighting
+    again, _ = mgr.register_device({"mac": "aa:bb:cc:00:00:01"}, seen_ip="192.168.1.101")
+    assert again["seen_ip"] == "192.168.1.101"
+    assert mgr.ip_mismatches() == []
+
+    # the post-run / boot-agent status call is a check-in too
+    assert mgr.update_status("aa:bb:cc:00:00:01", "CONFIGURED", seen_ip="192.168.169.77")
+    mismatches = mgr.ip_mismatches()
+    assert len(mismatches) == 1, mismatches
+    assert mismatches[0]["hostname"] == "nuc-101"
+    assert mismatches[0]["seen_ip"] == "192.168.169.77"
+    assert mismatches[0]["assigned_ip"] == "192.168.1.101"
+    text = open(mgr.output_csv, encoding="utf-8").read()
+    assert "seen_ip" in text.splitlines()[0]
+    assert "192.168.169.77" in text
+
+
+def test_seen_column_and_mismatch_banner_name_the_unit():
+    mgr = _manager(tempfile.mkdtemp())
+    mgr.register_device({"mac": "aa:bb:cc:00:00:01"}, seen_ip="192.168.169.45")
+    mgr.register_device({"mac": "aa:bb:cc:00:00:02"}, seen_ip="192.168.1.102")
+    previous, S.inventory_mgr = S.inventory_mgr, mgr
+    try:
+        handler = S.DeploymentRequestHandler.__new__(S.DeploymentRequestHandler)
+        rows = handler.render_device_rows(list(mgr.records.values()), handler.pools_payload())
+        assert "&#10007;" in rows and "192.168.169.45" in rows
+        assert "&#10003;" in rows
+        page = handler.render_dashboard()
+        assert "Seen as" in page
+        assert "nuc-101" in page and "192.168.169.45" in page
+        banners = handler.render_alert_banners({
+            "warnings": [], "primary": None, "mismatches": mgr.ip_mismatches()})
+        assert "nuc-101" in banners and "192.168.169.45" in banners
+        assert "assigned address" in banners
+    finally:
+        S.inventory_mgr = previous
+
+
+def test_boot_agent_persists_and_is_injected_into_the_client_script():
+    tmp = tempfile.mkdtemp()
+    mgr = _manager(tmp)
+    assert mgr.settings["boot_agent"] is True
+    page_mgr = mgr
+    previous, S.inventory_mgr = S.inventory_mgr, page_mgr
+    try:
+        handler = S.DeploymentRequestHandler.__new__(S.DeploymentRequestHandler)
+        page = handler.render_dashboard()
+        assert "Keep NUCs in sync on every boot" in page
+        assert 'id="set-boot-agent"' in page and "checked" in page
+    finally:
+        S.inventory_mgr = previous
+
+    mgr.apply_config({"pools": [p.to_config_dict() for p in mgr.subnet_pools],
+                      "settings": {"boot_agent": False}})
+    assert mgr.settings["boot_agent"] is False
+    stored = json.load(open(mgr.config_path, encoding="utf-8"))
+    assert stored["settings"]["boot_agent"] is False
+
+    fresh_pools = [S.SubnetPool.from_config_dict(p) for p in stored["pools"]]
+    fresh = _manager(tmp, pools=fresh_pools, **stored["settings"])
+    assert fresh.settings["boot_agent"] is False
+
+    on = S.client_script_preamble("192.168.169.250", 8000, "default", True)
+    off = S.client_script_preamble("192.168.169.250", 8000, "default", False)
+    assert 'DEPLOY_BOOT_AGENT:=1' in on
+    assert 'DEPLOY_BOOT_AGENT:=0' in off
+    assert "export DEPLOY_SERVER DEPLOY_PORT DEPLOY_POOL DEPLOY_BOOT_AGENT" in on
+    assert "DEPLOY_BOOT_AGENT=0" in mgr.hook_commands()["injected"]
+
+
+def test_bench_warning_names_a_pool_on_the_wrong_network():
+    networks = [{"iface": "eth0", "address": "192.168.169.250", "prefix": 24,
+                 "network": "192.168.169.0/24", "gateway": "192.168.169.254"}]
+    mgr = _manager(tempfile.mkdtemp(),
+                   pools=[S.SubnetPool(name="default", network="192.168.100.0/24",
+                                       start_ip=101, max_ip=250, gateway="192.168.100.1")],
+                   server_ip="192.168.100.1")
+    report = mgr.bench_status(networks=networks)
+    assert report["ok"] is False, report
+    assert report["warnings"], report
+    line = S.format_startup_warning(report["warnings"][0])
+    assert line.startswith(
+        "[!] Pool 'default' uses 192.168.100.0/24, but this PC is only on 192.168.169.0/24"), line
+    assert any("192.168.100.1" in w and "not an address of this PC" in w for w in report["warnings"])
+
+    same = _manager(tempfile.mkdtemp(),
+                    pools=[S.SubnetPool(name="default", network="192.168.169.0/24",
+                                        gateway="192.168.169.254")],
+                    server_ip="192.168.169.250")
+    quiet = same.bench_status(networks=networks)
+    assert quiet["ok"] is True and quiet["warnings"] == [], quiet
+    # nothing detected -> stay quiet rather than invent a mismatch
+    assert mgr.bench_status(networks=[])["ok"] is True
+
+
+def test_adopt_rewrites_the_default_pool_onto_this_pc():
+    tmp = tempfile.mkdtemp()
+    mgr = _manager(tmp,
+                   pools=[S.SubnetPool(name="default", network="192.168.100.0/24",
+                                       start_ip=101, max_ip=250, gateway="192.168.100.1"),
+                          S.SubnetPool(name="office", network="10.10.35.0/24",
+                                       start_ip=1, max_ip=20)],
+                   server_ip="192.168.100.1")
+    out = mgr.adopt_bench({"address": "192.168.169.250", "prefix": 24,
+                           "gateway": "192.168.169.254", "iface": "eth0"})
+    pool = mgr.get_pool_by_name("default")
+    assert str(pool.network) == "192.168.169.0/24", pool.network
+    assert pool.gateway == "192.168.169.254"
+    assert mgr.settings["server_ip"] == "192.168.169.250"
+    assert (pool.start_ip, pool.max_ip) == (101, 250)
+    assert pool.ip_at(pool.current_ip_counter) == "192.168.169.101", pool.current_ip_counter
+    assert out["next_ip"] == "192.168.169.101"
+    # the other pool is not rewritten
+    assert str(mgr.get_pool_by_name("office").network) == "10.10.35.0/24"
+    stored = json.load(open(mgr.config_path, encoding="utf-8"))
+    assert stored["pools"][0]["network"] == "192.168.169.0/24"
+    assert stored["settings"]["server_ip"] == "192.168.169.250"
+    assert "192.168.169.250" in stored["pools"][0]["reserve"]
+    hooks = mgr.hook_commands()
+    assert "http://192.168.169.250:8000/client/configure_network.sh" in hooks["postrun"]
+
+
+def test_adopt_keeps_range_numbers_and_skips_gateway_and_this_pc():
+    mgr = _manager(tempfile.mkdtemp(),
+                   pools=[S.SubnetPool(name="default", network="10.0.0.0/16",
+                                       start_ip=101, max_ip=250, gateway="10.0.0.1")])
+    mgr.adopt_bench({"address": "192.168.169.250", "prefix": 24, "gateway": "192.168.169.254"})
+    pool = mgr.default_pool
+    assert (pool.start_ip, pool.max_ip) == (101, 250)
+    taken = mgr.taken_offsets(pool)
+    assert pool.offset_of("192.168.169.250") in taken
+    assert pool.offset_of("192.168.169.254") in taken
+    handed = []
+    while True:
+        try:
+            ip, _host = pool.allocate_next(mgr.taken_offsets(pool))
+        except ValueError:
+            break
+        handed.append(ip)
+    assert handed and handed[0] == "192.168.169.101"
+    assert "192.168.169.250" not in handed
+    assert "192.168.169.254" not in handed
+
+    # numbers that cannot fit the new network are clamped, not rejected
+    wide = _manager(tempfile.mkdtemp(),
+                    pools=[S.SubnetPool(name="default", network="10.30.0.0/16",
+                                        start_ip=1000, max_ip=5000)])
+    wide.adopt_bench({"address": "10.9.9.10", "prefix": 24, "gateway": "10.9.9.1"})
+    assert str(wide.default_pool.network) == "10.9.9.0/24"
+    assert wide.default_pool.start_ip <= wide.default_pool.host_limit
+    assert wide.default_pool.max_ip <= wide.default_pool.host_limit
+    assert wide.settings["server_ip"] == "10.9.9.10"
+
+
+def test_data_lock_is_reentrant_for_adopt():
+    # adopt_bench holds DATA_LOCK and then calls apply_config, which takes it again.
+    # A plain Lock would deadlock here; fail on the type before we can hang.
+    assert type(S.DATA_LOCK).__name__ == "RLock", type(S.DATA_LOCK)
+    mgr = _manager(tempfile.mkdtemp(),
+                   pools=[S.SubnetPool(name="default", network="192.168.100.0/24",
+                                       start_ip=101, max_ip=250, gateway="192.168.100.1")],
+                   server_ip="192.168.100.1")
+    with S.DATA_LOCK:
+        out = mgr.adopt_bench({"address": "192.168.169.250", "prefix": 24,
+                               "gateway": "192.168.169.254"})
+    assert out["server_ip"] == "192.168.169.250"
+    assert str(mgr.default_pool.network) == "192.168.169.0/24"
+
+
+def test_dashboard_payload_carries_bench_and_mismatch_banners():
+    mgr = _manager(tempfile.mkdtemp(),
+                   pools=[S.SubnetPool(name="default", network="192.168.100.0/24",
+                                       gateway="192.168.100.1")],
+                   server_ip="192.168.100.1")
+    mgr.register_device({"mac": "aa:bb:cc:00:00:01"}, seen_ip="192.168.169.45")
+    previous, S.inventory_mgr = S.inventory_mgr, mgr
+    try:
+        handler = S.DeploymentRequestHandler.__new__(S.DeploymentRequestHandler)
+        networks = [{"iface": "eth0", "address": "192.168.169.250", "prefix": 24,
+                     "network": "192.168.169.0/24", "gateway": "192.168.169.254"}]
+        bench = mgr.bench_status(networks=networks)
+        banners = handler.render_alert_banners(bench)
+        assert "Use this PC's network" in banners
+        assert 'data-address="192.168.169.250"' in banners
+        assert 'data-prefix="24"' in banners
+        assert "nuc-101" in banners and "192.168.169.45" in banners
+        # the poll endpoint returns the same banners so a refresh can swap them in place
+        payload = handler.dashboard_payload()
+    finally:
+        S.inventory_mgr = previous
+    for key in ("banners", "bench", "mismatches", "rows", "stats", "pool_cards"):
+        assert key in payload, key
+    assert payload["mismatches"][0]["seen_ip"] == "192.168.169.45"
+    assert payload["mismatches"][0]["hostname"] == "nuc-101"
+    assert "nuc-101" in payload["banners"]
+    assert "banners" in S.DASHBOARD_JS and "adopt-bench" in S.DASHBOARD_JS
+
+
+def test_local_network_parsers_and_detection():
+    addrs = S.parse_ip_addr(
+        "2: eth0    inet 192.168.169.250/24 brd 192.168.169.255 scope global eth0\n"
+        "1: lo    inet 127.0.0.1/8 scope host lo\n")
+    assert addrs == [{"iface": "eth0", "address": "192.168.169.250", "prefix": 24}], addrs
+    routes = S.parse_ip_route(
+        "default via 192.168.169.254 dev eth0\n"
+        "192.168.169.0/24 dev eth0 proto kernel scope link src 192.168.169.250\n")
+    assert routes["eth0"] == "192.168.169.254"
+    # FEA9A8C0 is the little-endian /proc/net/route form of 192.168.169.254
+    proc = ("Iface Destination Gateway Flags RefCnt Use Metric Mask MTU Window IRTT\n"
+            "eth0 00000000 FEA9A8C0 0003 0 0 0 00000000 0 0 0\n")
+    assert S.parse_proc_net_route(proc)["eth0"] == "192.168.169.254"
+    live = S.detect_local_networks()
+    assert isinstance(live, list)
+    for net in live:
+        assert not str(net["address"]).startswith("127.")
+        assert "/" in net["network"]
+        assert net["iface"]
+    # the helper used at startup must be the same sentence the dashboard shows
+    sample = S.format_startup_warning(
+        "Pool 'default' uses 192.168.100.0/24, but this PC is only on 192.168.169.0/24 (eth0 192.168.169.250)")
+    assert sample.startswith("[!] Pool 'default' uses 192.168.100.0/24, but this PC is only on")
+
+
 if __name__ == "__main__":
     passed = 0
     for name, fn in sorted(globals().items()):

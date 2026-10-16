@@ -11,7 +11,9 @@ Provides:
   Web Dashboard and persisted to network_config.json - no file/CLI editing needed
 - Real-time Web Dashboard for tracking 150 NUC deployments
 - Static file delivery for Clonezilla pre-run and post-run scripts
-  (client scripts get the current server IP/port/pool auto-injected on the fly)
+  (client scripts get the current server IP/port/pool/boot-agent auto-injected)
+- Records the address each check-in really came from, and warns when a pool
+  is not on the same network as this PC
 """
 
 import sys
@@ -22,13 +24,22 @@ import csv
 import argparse
 import threading
 import ipaddress
+import socket
+import struct
+import subprocess
 from http.server import HTTPServer, SimpleHTTPRequestHandler
 from urllib.parse import urlparse
 from datetime import datetime
 from html import escape as html_escape
 
-# Global lock for thread-safe state and CSV writes
-DATA_LOCK = threading.Lock()
+try:
+    import fcntl
+except ImportError:  # Windows has no ioctl; detection falls back to "nothing found"
+    fcntl = None
+
+# Re-entrant: adopt_bench() holds the lock and then calls apply_config(), which
+# takes it again. A plain Lock would deadlock that path.
+DATA_LOCK = threading.RLock()
 
 CONFIG_VERSION = 1
 CONFIG_FILENAME = "network_config.json"
@@ -37,6 +48,7 @@ CSV_FIELDS = [
     "timestamp", "status", "assigned_hostname", "assigned_ip",
     "mac", "serial", "model", "windows_key", "key_source",
     "notes", "pool", "gateway", "netmask", "dns", "pinned",
+    "seen_ip", "seen_at",
 ]
 
 # What a hand-edited identity can be pinned to. Kept as a CSV column so a restart
@@ -55,6 +67,8 @@ DEFAULT_SETTINGS = {
     "hostname_prefix": "nuc-",  # Default prefix for newly created pools
     "target_count": 150,      # Fleet size shown on the dashboard
     "default_pool": "default",  # Pool used when a device asks for no pool
+    # Install mgw-identity.service so a dashboard rename/IP lands at next boot.
+    "boot_agent": True,
 }
 
 
@@ -115,6 +129,173 @@ def format_pinned(pins):
     return ",".join(p for p in (PIN_IP, PIN_NAME) if p in (pins or set()))
 
 
+def coerce_bool(value, default=False):
+    """JSON true/false, 1/0, yes/no — what the dashboard checkbox and the CLI send."""
+    if isinstance(value, bool):
+        return value
+    if value is None:
+        return default
+    text = str(value).strip().lower()
+    if text in ("1", "true", "yes", "on", "y"):
+        return True
+    if text in ("0", "false", "no", "off", "n", ""):
+        return False
+    return default
+
+
+def _run_cmd(cmd, timeout=3):
+    """stdout of a short system command, or '' if it is missing or fails."""
+    try:
+        proc = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout)
+    except (OSError, subprocess.SubprocessError):
+        return ""
+    return proc.stdout or ""
+
+
+def parse_ip_addr(text):
+    """Parse `ip -4 -o addr` lines into [{iface, address, prefix}]. Loopback is skipped."""
+    found = []
+    for line in str(text or "").splitlines():
+        match = re.search(
+            r"^\d+:\s+(\S+?)\s+inet\s+(\d+\.\d+\.\d+\.\d+)/(\d+)", line.strip())
+        if not match:
+            continue
+        iface = match.group(1).rstrip(":")
+        if iface == "lo" or iface.startswith("lo"):
+            continue
+        address = match.group(2)
+        if address.startswith("127."):
+            continue
+        found.append({"iface": iface, "address": address, "prefix": int(match.group(3))})
+    return found
+
+
+def parse_ip_route(text):
+    """Parse `ip -4 route` for default gateways. iface -> address, plus '*' for the first."""
+    gateways = {}
+    for line in str(text or "").splitlines():
+        match = re.search(
+            r"^default\s+via\s+(\d+\.\d+\.\d+\.\d+)\s+dev\s+(\S+)", line.strip())
+        if not match:
+            continue
+        gateways[match.group(2)] = match.group(1)
+        gateways.setdefault("*", match.group(1))
+    return gateways
+
+
+def parse_proc_net_route(text):
+    """Parse /proc/net/route (little-endian hex) for the default gateway per iface."""
+    gateways = {}
+    for line in str(text or "").splitlines()[1:]:
+        parts = line.split()
+        if len(parts) < 4:
+            continue
+        iface, dest, gateway, flags_s = parts[0], parts[1], parts[2], parts[3]
+        try:
+            flags = int(flags_s, 16)
+            if dest != "00000000" or not (flags & 0x2):
+                continue
+            ip = socket.inet_ntoa(struct.pack("<L", int(gateway, 16)))
+        except (ValueError, OSError, struct.error):
+            continue
+        if ip == "0.0.0.0":
+            continue
+        gateways[iface] = ip
+        gateways.setdefault("*", ip)
+    return gateways
+
+
+def _addrs_from_ioctl():
+    """IPv4 addresses via SIOCGIFADDR / SIOCGIFNETMASK. stdlib only, Linux."""
+    if fcntl is None:
+        return []
+    found = []
+    try:
+        names = [name for _, name in socket.if_nameindex()]
+    except OSError:
+        return found
+    sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    try:
+        for name in names:
+            if not name or name == "lo":
+                continue
+            try:
+                packed = struct.pack("16s16s", name.encode()[:15], b"\0" * 16)
+                res = fcntl.ioctl(sock.fileno(), 0x8915, packed)       # SIOCGIFADDR
+                ip = socket.inet_ntoa(res[20:24])
+                maskres = fcntl.ioctl(sock.fileno(), 0x891b, packed)    # SIOCGIFNETMASK
+                mask = socket.inet_ntoa(maskres[20:24])
+                prefix = ipaddress.IPv4Network(f"0.0.0.0/{mask}").prefixlen
+            except OSError:
+                continue
+            if ip.startswith("127."):
+                continue
+            found.append({"iface": name, "address": ip, "prefix": prefix})
+    finally:
+        sock.close()
+    return found
+
+
+def _gateways_from_proc():
+    try:
+        with open("/proc/net/route", "r", encoding="utf-8", errors="replace") as handle:
+            return parse_proc_net_route(handle.read())
+    except OSError:
+        return {}
+
+
+def detect_local_networks():
+    """IPv4 networks of this PC.
+
+    Order: `ip -4 -o addr`, then ioctl; gateway from `ip route`, then /proc/net/route.
+    Never raises — a bench server with no `ip` still starts.
+    """
+    try:
+        addrs = parse_ip_addr(_run_cmd(["ip", "-4", "-o", "addr"])) or _addrs_from_ioctl()
+        gateways = parse_ip_route(_run_cmd(["ip", "-4", "route"])) or _gateways_from_proc()
+    except Exception:
+        return []
+    found = []
+    for item in addrs:
+        try:
+            network = ipaddress.IPv4Network(
+                f"{item['address']}/{int(item['prefix'])}", strict=False)
+        except (ValueError, TypeError):
+            continue
+        gateway = gateways.get(item["iface"]) or gateways.get("*") or ""
+        found.append({
+            "iface": item["iface"],
+            "address": item["address"],
+            "prefix": int(item["prefix"]),
+            "network": str(network),
+            "gateway": gateway,
+        })
+    return found
+
+
+def primary_network(networks):
+    """The network that owns the default route, else the first one detected."""
+    for net in networks or []:
+        if net.get("gateway"):
+            return net
+    return (networks or [None])[0]
+
+
+def describe_networks(networks):
+    if not networks:
+        return "no IPv4 network"
+    return ", ".join(
+        f"{net['network']} ({net.get('iface') or '?'} {net['address']})"
+        for net in networks)
+
+
+def format_startup_warning(warning):
+    text = str(warning or "").strip()
+    if not text:
+        return ""
+    return text if text.startswith("[!]") else f"[!] {text}"
+
+
 class SubnetPool:
     """A named IPv4 address pool that hands out sequential addresses.
 
@@ -129,7 +310,7 @@ class SubnetPool:
 
     def __init__(self, name, network, start_ip=None, max_ip=None, gateway=None,
                  dns="1.1.1.1,8.8.8.8", hostname_prefix="nuc-", cidr=None,
-                 next_offset=None):
+                 next_offset=None, reserve=None):
         self.name = self._clean_name(name)
         self.network = self.parse_network(network, cidr)
         self.host_limit = max(1, self.network.num_addresses - 2)  # skip network+broadcast
@@ -154,6 +335,7 @@ class SubnetPool:
 
         self.dns = self._clean_dns(dns)
         self.hostname_prefix = self._clean_prefix(hostname_prefix)
+        self.reserve = self._clean_reserve(reserve)
         self.adjustments = []
         self.current_ip_counter = self._clean_offset(
             self.start_ip if next_offset is None else next_offset,
@@ -183,6 +365,18 @@ class SubnetPool:
             if not is_ipv4(item):
                 raise ValueError(f"'{item}' is not a valid DNS server address")
         return ",".join(items[:3])
+
+    @staticmethod
+    def _clean_reserve(reserve):
+        """Addresses that must never be handed to a NUC (this PC, the gateway)."""
+        if isinstance(reserve, str):
+            reserve = reserve.replace(";", ",").split(",")
+        items = []
+        for item in reserve or []:
+            text = str(item).strip()
+            if is_ipv4(text) and text not in items:
+                items.append(text)
+        return items
 
     @staticmethod
     def _clean_prefix(prefix):
@@ -318,7 +512,7 @@ class SubnetPool:
     # ------------------------------------------------------------ serialisation
     def to_config_dict(self):
         """Keys accepted by from_config_dict() - this is what network_config.json holds."""
-        return {
+        data = {
             "name": self.name,
             "network": str(self.network),
             "start": self.start_ip,
@@ -328,6 +522,9 @@ class SubnetPool:
             "prefix": self.hostname_prefix,
             "next_offset": self.current_ip_counter,
         }
+        if self.reserve:
+            data["reserve"] = list(self.reserve)
+        return data
 
     def to_dict(self):
         data = self.to_config_dict()
@@ -375,6 +572,7 @@ class SubnetPool:
                 if raw is not None and str(raw).strip() != "":
                     pool.set_next(raw)
                     break
+        pool.reserve = cls._clean_reserve(data.get("reserve", data.get("reserved")))
         return pool
 
     @staticmethod
@@ -464,6 +662,12 @@ class InventoryManager:
         sources = [r.get("assigned_ip", "") for r in self.records.values()]
         sources += [e.get("ip", "") for e in self.predefined_pool.values()]
         for ip in sources:
+            offset = pool.offset_of(ip)
+            if offset is not None:
+                taken.add(offset)
+        # Addresses reserved when the pool was adopted onto this PC's network
+        # (the master itself, and the bench gateway) are never handed to a NUC.
+        for ip in getattr(pool, "reserve", None) or []:
             offset = pool.offset_of(ip)
             if offset is not None:
                 taken.add(offset)
@@ -689,6 +893,8 @@ class InventoryManager:
                 clean[key] = value
             elif key == "hostname_prefix":
                 clean[key] = SubnetPool._clean_prefix(value)
+            elif key == "boot_agent":
+                clean[key] = coerce_bool(value)
             else:
                 clean[key] = str(value).strip()
         return clean
@@ -790,11 +996,26 @@ class InventoryManager:
         os.replace(temp_file, self.output_csv)
 
     # ----------------------------------------------------------------- register
-    def register_device(self, data):
+    def _note_seen(self, record, seen_ip):
+        """Remember the address a check-in really came from. Returns True if it changed."""
+        seen = str(seen_ip or "").strip()
+        if not seen or not record:
+            return False
+        now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        if record.get("seen_ip") == seen and record.get("seen_at"):
+            # still refresh the timestamp: a repeat check-in is new evidence
+            record["seen_at"] = now
+            return True
+        record["seen_ip"] = seen
+        record["seen_at"] = now
+        return True
+
+    def register_device(self, data, seen_ip=None):
         with DATA_LOCK:
             mac = data.get("mac", "").strip().lower()
             if not mac:
                 return {"error": "Missing MAC address"}, 400
+            seen_ip = seen_ip or data.get("seen_ip") or data.get("_seen_ip")
 
             # Determine which subnet pool to use
             requested_pool_name = str(data.get("pool", "")).strip()
@@ -804,10 +1025,15 @@ class InventoryManager:
             if mac in self.records:
                 record = self.records[mac]
                 # Update key if previously missing and now found
+                changed = False
                 if not record.get("windows_key") and data.get("windows_key"):
                     record["windows_key"] = data.get("windows_key")
                     record["key_source"] = data.get("key_source", "UPDATED")
                     record["timestamp"] = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+                    changed = True
+                if self._note_seen(record, seen_ip):
+                    changed = True
+                if changed:
                     self.save_record_to_csv(record)
                 # Look up the pool this device was assigned to
                 device_pool = self.get_pool_by_name(record.get("pool", "")) or self.default_pool
@@ -821,6 +1047,8 @@ class InventoryManager:
                     "dns": record.get("dns") or device_pool.dns,
                     "windows_key": record.get("windows_key", ""),
                     "pool": record.get("pool", device_pool.name),
+                    "seen_ip": record.get("seen_ip", ""),
+                    "seen_at": record.get("seen_at", ""),
                 }, 200
 
             # Check if MAC has predefined static IP in pool CSV
@@ -873,7 +1101,10 @@ class InventoryManager:
                 "cidr": cidr,
                 "dns": dns,
                 "pinned": format_pinned(pins),
+                "seen_ip": "",
+                "seen_at": "",
             }
+            self._note_seen(record, seen_ip)
 
             self.records[mac] = record
             self.save_record_to_csv(record)
@@ -892,6 +1123,8 @@ class InventoryManager:
                 "dns": dns,
                 "windows_key": record["windows_key"],
                 "pool": pool_name_used,
+                "seen_ip": record.get("seen_ip", ""),
+                "seen_at": record.get("seen_at", ""),
             }, 200
 
     def reassign_device(self, mac, new_pool_name, new_ip=None):
@@ -1259,7 +1492,7 @@ class InventoryManager:
                     "pools": [p.to_dict() for p in self.subnet_pools],
                     "settings": dict(self.settings)}
 
-    def update_status(self, mac, status, notes=""):
+    def update_status(self, mac, status, notes="", seen_ip=None):
         with DATA_LOCK:
             mac = mac.strip().lower()
             if mac in self.records:
@@ -1267,12 +1500,192 @@ class InventoryManager:
                 if notes:
                     self.records[mac]["notes"] = notes
                 self.records[mac]["timestamp"] = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+                self._note_seen(self.records[mac], seen_ip)
                 self.save_record_to_csv(self.records[mac])
                 print(f"[*] STATUS UPDATE: {self.records[mac]['assigned_hostname']} ({mac}) -> {status}")
                 return True
             return False
 
     # --------------------------------------------------------- dashboard helpers
+    def ip_mismatches(self):
+        """Units whose last check-in did not come from the address we assigned."""
+        found = []
+        for rec in self.records.values():
+            seen = str(rec.get("seen_ip") or "").strip()
+            assigned = str(rec.get("assigned_ip") or "").strip()
+            if seen and assigned and seen != assigned:
+                found.append({
+                    "mac": rec.get("mac", ""),
+                    "hostname": rec.get("assigned_hostname", ""),
+                    "assigned_ip": assigned,
+                    "seen_ip": seen,
+                    "seen_at": rec.get("seen_at", ""),
+                })
+        return found
+
+    def bench_status(self, networks=None):
+        """Compare configured pools with the networks this PC is actually on.
+
+        A pool "works" only when at least one address of this PC sits inside it —
+        otherwise a NUC given that pool's address can never reach the server, and
+        a dashboard edit can never reach the NUC. No detected networks means we
+        cannot judge (a container, Windows, or `ip` missing) and we stay quiet.
+        """
+        if networks is None:
+            networks = detect_local_networks()
+        warnings = []
+        if networks:
+            where = describe_networks(networks)
+            local = {net["address"] for net in networks}
+            for pool in self.subnet_pools:
+                reachable = False
+                for net in networks:
+                    try:
+                        if ipaddress.IPv4Address(net["address"]) in pool.network:
+                            reachable = True
+                            break
+                    except (ValueError, TypeError):
+                        continue
+                if not reachable:
+                    warnings.append(
+                        f"Pool '{pool.name}' uses {pool.network}, but this PC is only on {where}")
+            server_ip = str(self.settings.get("server_ip") or "").strip()
+            if server_ip and is_ipv4(server_ip) and server_ip not in local:
+                warnings.append(
+                    f"Master / server IP {server_ip} is not an address of this PC "
+                    f"(this PC is {', '.join(sorted(local))})")
+        return {
+            "ok": not warnings,
+            "networks": list(networks or []),
+            "warnings": warnings,
+            "primary": primary_network(networks),
+            "mismatches": self.ip_mismatches(),
+        }
+
+    def adopt_bench(self, spec=None):
+        """Rewrite the default pool onto the network this PC is actually on.
+
+        Keeps the old range numbers (101-250, say) when they still fit, moves the
+        master/server IP to this PC's address, and reserves that address plus the
+        gateway so neither is ever handed to a NUC. Holds DATA_LOCK and then calls
+        apply_config(), which takes the same lock — DATA_LOCK is therefore an RLock.
+        """
+        spec = spec or {}
+        with DATA_LOCK:
+            address = str(spec.get("address") or "").strip()
+            prefix = spec.get("prefix", spec.get("cidr"))
+            gateway = str(spec.get("gateway") or "").strip()
+            iface = str(spec.get("iface") or "").strip()
+            if not address:
+                primary = primary_network(detect_local_networks())
+                if not primary:
+                    raise ValueError("this PC has no detected IPv4 network to adopt")
+                address = primary["address"]
+                prefix = primary["prefix"]
+                gateway = gateway or primary.get("gateway") or ""
+                iface = iface or primary.get("iface") or ""
+            if "/" in address and prefix in (None, ""):
+                address, _, prefix = address.partition("/")
+            if not is_ipv4(address):
+                raise ValueError(f"'{address}' is not a valid IPv4 address")
+            try:
+                prefix = int(prefix)
+            except (TypeError, ValueError):
+                raise ValueError("prefix (CIDR length) is required, e.g. 24")
+            if not (1 <= prefix <= 30):
+                raise ValueError(f"prefix /{prefix} is not a usable IPv4 network")
+            network = ipaddress.IPv4Network(f"{address}/{prefix}", strict=False)
+            address = str(ipaddress.IPv4Address(address))
+            if gateway and not is_ipv4(gateway):
+                raise ValueError(f"'{gateway}' is not a valid gateway address")
+            if not gateway:
+                gateway = str(network.network_address + 1)
+
+            pool = self.default_pool
+            host_limit = max(1, network.num_addresses - 2)
+            # Keep the numbers the technician already chose (101-250) when the new
+            # network is large enough; otherwise clamp to what actually fits.
+            if 1 <= pool.start_ip <= host_limit:
+                start = pool.start_ip
+            else:
+                start = 1
+            if 1 <= pool.max_ip <= host_limit:
+                end = pool.max_ip
+            else:
+                end = host_limit
+            if end < start:
+                start, end = 1, host_limit
+            cursor = pool.current_ip_counter
+            if cursor < start or cursor > host_limit:
+                cursor = start
+            if cursor > end:
+                cursor = start
+
+            reserve = []
+            for ip in (address, gateway):
+                try:
+                    host = ipaddress.IPv4Address(ip)
+                except ValueError:
+                    continue
+                if host not in network or ip in reserve:
+                    continue
+                offset = int(host) - int(network.network_address)
+                if 1 <= offset <= host_limit and ip not in reserve:
+                    reserve.append(ip)
+            reserved_offsets = {
+                int(ipaddress.IPv4Address(ip)) - int(network.network_address)
+                for ip in reserve
+            }
+            while cursor in reserved_offsets and cursor <= end:
+                cursor += 1
+            if cursor > end:
+                cursor = end + 1
+
+            new_pool = {
+                "name": pool.name,
+                "network": str(network),
+                "start": start,
+                "max": end,
+                "gateway": gateway,
+                "dns": pool.dns,
+                "prefix": pool.hostname_prefix,
+                "next_offset": cursor,
+                "reserve": reserve,
+            }
+            pools = []
+            for existing in self.subnet_pools:
+                if existing.name.lower() == pool.name.lower():
+                    pools.append(new_pool)
+                else:
+                    pools.append(existing.to_config_dict())
+            settings = dict(self.settings)
+            settings["server_ip"] = address
+            result = self.apply_config({"pools": pools, "settings": settings})
+            adopted = self.default_pool
+            notes = [
+                f"default pool '{adopted.name}' is now {adopted.network}",
+                f"kept host range {adopted.start_ip}-{adopted.max_ip}",
+                f"master / server IP is {self.settings.get('server_ip')}",
+            ]
+            if reserve:
+                notes.append("reserved (never handed to a NUC): " + ", ".join(reserve))
+            if iface:
+                notes.append(f"taken from {iface}")
+            next_ip = adopted.ip_at(min(adopted.current_ip_counter, adopted.host_limit))
+            result.update({
+                "status": "adopted",
+                "network": str(adopted.network),
+                "server_ip": self.settings.get("server_ip"),
+                "gateway": adopted.gateway,
+                "next_ip": next_ip,
+                "notes": notes,
+                "reserve": list(adopted.reserve),
+            })
+            print(f"[+] Adopted {adopted.network} for pool '{adopted.name}' "
+                  f"(master {self.settings.get('server_ip')}, gateway {adopted.gateway}, "
+                  f"next {next_ip})")
+            return result
+
     def hook_commands(self):
         """Ready-to-paste Clonezilla hook commands for the current settings."""
         server = self.settings.get("server_ip") or self.default_pool.gateway
@@ -1286,12 +1699,32 @@ class InventoryManager:
             "postrun": f"curl -s {base}/client/configure_network.sh | bash",
             "injected": (
                 "# These values are injected automatically when the NUC downloads the script:\n"
-                f"DEPLOY_SERVER={server} DEPLOY_PORT={port} DEPLOY_POOL={pool or 'default'}"
+                f"DEPLOY_SERVER={server} DEPLOY_PORT={port} DEPLOY_POOL={pool or 'default'} "
+                f"DEPLOY_BOOT_AGENT={'1' if coerce_bool(self.settings.get('boot_agent'), True) else '0'}"
             ),
         }
 
 
 inventory_mgr: InventoryManager = None
+
+
+def client_script_preamble(server, port, pool_name, boot_agent):
+    """Shell snippet injected when a NUC downloads a client hook.
+
+    DEPLOY_BOOT_AGENT is what configure_network.sh reads to install (1) or remove
+    (0) the on-boot identity agent. The `:=` form leaves an explicit override alone.
+    """
+    boot = "1" if coerce_bool(boot_agent, True) else "0"
+    pool_name = pool_name or "default"
+    return (
+        "# ---- MGW_Kompy live configuration (managed in the web dashboard) ----\n"
+        f'if [ -z "${{DEPLOY_SERVER:-}}" ] && [ -z "${{1:-}}" ]; then DEPLOY_SERVER="{server}"; fi\n'
+        f': "${{DEPLOY_PORT:={port}}}"\n'
+        f': "${{DEPLOY_POOL:={pool_name}}}"\n'
+        f': "${{DEPLOY_BOOT_AGENT:={boot}}}"\n'
+        "export DEPLOY_SERVER DEPLOY_PORT DEPLOY_POOL DEPLOY_BOOT_AGENT\n"
+        "# ----------------------------------------------------------------------\n"
+    )
 
 
 class DeploymentRequestHandler(SimpleHTTPRequestHandler):
@@ -1326,6 +1759,13 @@ class DeploymentRequestHandler(SimpleHTTPRequestHandler):
 
     def read_only(self):
         return bool(inventory_mgr and inventory_mgr.read_only)
+
+    def client_ip(self):
+        """The address this check-in really came from (the socket, not a header)."""
+        try:
+            return str(self.client_address[0] or "").strip()
+        except Exception:
+            return ""
 
     # ------------------------------------------------------------------- GET
     def do_GET(self):
@@ -1369,18 +1809,14 @@ class DeploymentRequestHandler(SimpleHTTPRequestHandler):
 
         elif parsed.path == "/api/dashboard":
             # Everything the page needs to update itself *without* a reload: the counters,
-            # the pool cards and the NUC table (plus the per-device editors inside it).
+            # the pool cards, the NUC table and the bench / IP-mismatch banners.
+            self.send_json(self.dashboard_payload())
+            return
+
+        elif parsed.path == "/api/bench":
             with DATA_LOCK:
-                records = list(inventory_mgr.records.values())
-                pools_data = self.pools_payload()
-                predefined = inventory_mgr.predefined_payload()
-            self.send_json({
-                "stats": self.dashboard_stats(records),
-                "pool_cards": self.render_pool_cards(pools_data),
-                "rows": self.render_device_rows(records, pools_data),
-                "predefined_rows": self.render_predefined_rows(predefined),
-                "predefined": predefined,
-            })
+                payload = inventory_mgr.bench_status()
+            self.send_json(payload)
             return
 
         elif parsed.path == "/api/hooks":
@@ -1404,6 +1840,25 @@ class DeploymentRequestHandler(SimpleHTTPRequestHandler):
 
         # Serve everything else statically from the repo root
         super().do_GET()
+
+    def dashboard_payload(self):
+        """Counters, tables and the bench / mismatch banners, safe to poll in place."""
+        with DATA_LOCK:
+            records = list(inventory_mgr.records.values())
+            pools_data = self.pools_payload()
+            predefined = inventory_mgr.predefined_payload()
+            bench = inventory_mgr.bench_status()
+            banners = self.render_alert_banners(bench)
+        return {
+            "stats": self.dashboard_stats(records),
+            "pool_cards": self.render_pool_cards(pools_data),
+            "rows": self.render_device_rows(records, pools_data),
+            "predefined_rows": self.render_predefined_rows(predefined),
+            "predefined": predefined,
+            "banners": banners,
+            "bench": bench,
+            "mismatches": bench.get("mismatches", []),
+        }
 
     def pools_payload(self):
         pools = []
@@ -1430,14 +1885,8 @@ class DeploymentRequestHandler(SimpleHTTPRequestHandler):
         hooks = inventory_mgr.hook_commands()
         server, _, port = hooks["server"].rpartition(":")
         pool_name = inventory_mgr.settings.get("default_pool", "default") or "default"
-        block = (
-            "# ---- MGW_Kompy live configuration (managed in the web dashboard) ----\n"
-            f'if [ -z "${{DEPLOY_SERVER:-}}" ] && [ -z "${{1:-}}" ]; then DEPLOY_SERVER="{server}"; fi\n'
-            f': "${{DEPLOY_PORT:={port}}}"\n'
-            f': "${{DEPLOY_POOL:={pool_name}}}"\n'
-            "export DEPLOY_SERVER DEPLOY_PORT DEPLOY_POOL\n"
-            "# ----------------------------------------------------------------------\n"
-        )
+        block = client_script_preamble(
+            server, port, pool_name, inventory_mgr.settings.get("boot_agent", True))
         body = (head + "\n" + block + rest).encode("utf-8")
         self.send_response(200)
         self.send_header("Content-Type", "text/x-shellscript; charset=utf-8")
@@ -1457,15 +1906,21 @@ class DeploymentRequestHandler(SimpleHTTPRequestHandler):
 
         try:
             if parsed.path == "/api/register":
-                resp, code = inventory_mgr.register_device(body)
+                resp, code = inventory_mgr.register_device(body, seen_ip=self.client_ip())
                 self.send_json(resp, code)
                 return
 
             elif parsed.path == "/api/status":
                 success = inventory_mgr.update_status(body.get("mac", ""),
                                                        body.get("status", "UNKNOWN"),
-                                                       body.get("notes", ""))
+                                                       body.get("notes", ""),
+                                                       seen_ip=self.client_ip())
                 self.send_json({"success": success}, 200 if success else 404)
+                return
+
+            elif parsed.path == "/api/bench/adopt":
+                resp = inventory_mgr.adopt_bench(body)
+                self.send_json(resp)
                 return
 
             elif parsed.path == "/api/reassign":
@@ -1652,6 +2107,7 @@ class DeploymentRequestHandler(SimpleHTTPRequestHandler):
                 <td>{total - idx + 1}</td>
                 <td><strong>{html_escape(hostname)}</strong>{pin_badges}</td>
                 <td><code>{html_escape(ip)}</code></td>
+                <td>{self.render_seen(r)}</td>
                 <td>{pool_badge}</td>
                 <td><code class='text-muted'>{html_escape(mac)}</code></td>
                 <td>{html_escape(r.get('serial', ''))}</td>
@@ -1666,7 +2122,7 @@ class DeploymentRequestHandler(SimpleHTTPRequestHandler):
                 </td>
             </tr>
             <tr class="editor-row d-none" data-editor="{html_escape(mac, quote=True)}">
-                <td colspan="12">
+                <td colspan="13">
                     <div class="row g-2 align-items-end">
                         <div class="col-md-3">
                             <label class="form-label small text-muted mb-0">Computer name (hostname)</label>
@@ -1703,9 +2159,70 @@ class DeploymentRequestHandler(SimpleHTTPRequestHandler):
             </tr>
             """
         if not rows_html:
-            rows_html = ("<tr><td colspan='12' class='text-center py-4 text-muted'>"
+            rows_html = ("<tr><td colspan='13' class='text-center py-4 text-muted'>"
                          "No devices connected yet. Start PXE booting your NUCs!</td></tr>")
         return rows_html
+
+    def render_seen(self, record):
+        """Green check when the unit checked in from its assigned address, red cross otherwise."""
+        seen = str(record.get("seen_ip") or "").strip()
+        assigned = str(record.get("assigned_ip") or "").strip()
+        when = html_escape(record.get("seen_at") or "")
+        if not seen:
+            return '<span class="text-muted" title="has not checked in yet">&mdash;</span>'
+        if seen == assigned:
+            return (f'<span class="text-success seen-ok" title="checked in from {html_escape(seen)}'
+                    f' at {when}">&#10003;</span>')
+        return (f'<span class="text-danger seen-bad" title="assigned {html_escape(assigned)}, '
+                f'seen at {when}">&#10007; {html_escape(seen)}</span>')
+
+    def render_alert_banners(self, bench=None):
+        """Read-only note, IP-mismatch warning, and the 'wrong network' bench warning."""
+        bench = bench if bench is not None else inventory_mgr.bench_status()
+        parts = []
+        if inventory_mgr.read_only:
+            parts.append(
+                '<div class="alert alert-warning py-2 small mb-2">'
+                "Server is running with <code>--read-only</code>: pool editing is disabled. "
+                "Restart without that flag to edit subnets from this page."
+                "</div>")
+        mismatches = bench.get("mismatches") if bench.get("mismatches") is not None else inventory_mgr.ip_mismatches()
+        if mismatches:
+            lines = []
+            for item in mismatches:
+                unit = html_escape(item.get("hostname") or item.get("mac") or "a unit")
+                seen = html_escape(item.get("seen_ip") or "")
+                assigned = html_escape(item.get("assigned_ip") or "")
+                lines.append(
+                    f"<strong>{unit}</strong> checked in from <code>{seen}</code> "
+                    f"instead of its assigned address <code>{assigned}</code>")
+            parts.append(
+                '<div class="alert alert-danger py-2 small mb-2" id="mismatch-banner">'
+                "<strong>A NUC is not using its assigned address.</strong> "
+                + "<br>".join(lines)
+                + ". The bench router (not this server, and not FileZilla) is the usual "
+                "cause: its DHCP handed the unit a different address."
+                "</div>")
+        primary = bench.get("primary") or {}
+        warned_pool = False
+        for warning in bench.get("warnings") or []:
+            button = ""
+            if (not inventory_mgr.read_only and primary and not warned_pool
+                    and str(warning).startswith("Pool ")):
+                warned_pool = True
+                button = (
+                    ' <button type="button" class="btn btn-sm btn-warning adopt-bench ms-2"'
+                    f' data-address="{html_escape(primary.get("address", ""), quote=True)}"'
+                    f' data-prefix="{html_escape(str(primary.get("prefix", "")), quote=True)}"'
+                    f' data-gateway="{html_escape(primary.get("gateway") or "", quote=True)}"'
+                    f' data-iface="{html_escape(primary.get("iface") or "", quote=True)}">'
+                    "Use this PC's network</button>")
+            parts.append(
+                '<div class="alert alert-warning py-2 small mb-2" id="bench-banner">'
+                "<strong>The pool and this PC are not on the same network.</strong> "
+                f"{html_escape(warning)}.{button}"
+                "</div>")
+        return "\n".join(parts)
 
     def render_dashboard(self):
         with DATA_LOCK:
@@ -1723,11 +2240,7 @@ class DeploymentRequestHandler(SimpleHTTPRequestHandler):
         predefined_rows = self.render_predefined_rows(predefined)
 
         read_only = inventory_mgr.read_only
-        banner = ("""
-            <div class="alert alert-warning py-2 small mb-3">
-                Server is running with <code>--read-only</code>: pool editing is disabled.
-                Restart without that flag to edit subnets from this page.
-            </div>""" if read_only else "")
+        banner = self.render_alert_banners()
 
         html = f"""<!DOCTYPE html>
 <html lang="en">
@@ -1756,7 +2269,7 @@ class DeploymentRequestHandler(SimpleHTTPRequestHandler):
             </div>
         </div>
 
-        {banner}
+        <div id="banners">{banner}</div>
 
         <div class="row g-3 mb-4">
             <div class="col-md-3">
@@ -1821,6 +2334,15 @@ class DeploymentRequestHandler(SimpleHTTPRequestHandler):
                     <div class="col-md-7 text-md-end">
                         <button class="btn btn-sm btn-primary" id="save-settings" {'disabled' if read_only else ''}>Save global settings</button>
                     </div>
+                </div>
+                <div class="form-check mb-3">
+                    <input class="form-check-input" type="checkbox" id="set-boot-agent" {'checked' if settings.get('boot_agent', True) else ''} {'disabled' if read_only else ''}>
+                    <label class="form-check-label" for="set-boot-agent">
+                        <strong>Keep NUCs in sync on every boot</strong>
+                        <span class="text-muted small"> — install an on-boot agent so an IP or computer name
+                        changed here is applied the next time that unit boots
+                        (injected into the client script as <code>DEPLOY_BOOT_AGENT</code>).</span>
+                    </label>
                 </div>
 
                 <div class="table-responsive">
@@ -1906,6 +2428,7 @@ class DeploymentRequestHandler(SimpleHTTPRequestHandler):
                             <th>#</th>
                             <th>Hostname</th>
                             <th>IP Address</th>
+                            <th title="The address the unit actually checked in from">Seen as</th>
                             <th>Pool</th>
                             <th>MAC Address</th>
                             <th>Serial Number</th>
@@ -1993,6 +2516,9 @@ DASHBOARD_CSS = """
         .identity-msg { min-height: 1em; }
         .fixed-table input, .fixed-table td { font-size: .8rem; }
         .fixed-table code { font-size: .78rem; }
+        .seen-ok { font-weight: 700; }
+        .seen-bad { font-weight: 700; white-space: nowrap; }
+        #banners:empty { display: none; }
 """
 
 DASHBOARD_JS = """
@@ -2102,6 +2628,7 @@ DASHBOARD_JS = """
             if (typeof d.pool_cards === 'string') $('pool-cards').innerHTML = d.pool_cards;
             if (typeof d.rows === 'string') $('device-rows').innerHTML = d.rows;
             if (typeof d.predefined_rows === 'string') $('predefined-rows').innerHTML = d.predefined_rows;
+            if (typeof d.banners === 'string' && $('banners')) $('banners').innerHTML = d.banners;
             setText('last-updated', 'refreshed ' + new Date().toLocaleTimeString());
             return d;
         }).catch(function (e) {
@@ -2195,7 +2722,8 @@ DASHBOARD_JS = """
         $('set-server-ip').value = cfg.settings.server_ip || '';
         $('set-port').value = cfg.settings.port || '';
         $('set-target').value = cfg.settings.target_count || '';
-        ['set-server-ip', 'set-port', 'set-target', 'save-settings', 'pre-save'].forEach(function (id) {
+        if ($('set-boot-agent')) $('set-boot-agent').checked = !!cfg.settings.boot_agent;
+        ['set-server-ip', 'set-port', 'set-target', 'set-boot-agent', 'save-settings', 'pre-save'].forEach(function (id) {
             if ($(id)) $(id).disabled = READ_ONLY;
         });
         $('pool-rows').innerHTML = cfg.pools.map(function (p) { return row(p, false); }).join('');
@@ -2391,6 +2919,24 @@ DASHBOARD_JS = """
         }
         var del = t.closest('.pre-delete');
         if (del) { removePredefined(del.getAttribute('data-mac')); return; }
+        var adopt = t.closest('.adopt-bench');
+        if (adopt) {
+            if (!confirm('Move the default pool onto the network of this PC (' +
+                         (adopt.getAttribute('data-address') || '') + ')? ' +
+                         'Units already registered keep their current addresses.')) return;
+            api('/api/bench/adopt', {
+                address: adopt.getAttribute('data-address'),
+                prefix: adopt.getAttribute('data-prefix'),
+                gateway: adopt.getAttribute('data-gateway') || '',
+                iface: adopt.getAttribute('data-iface') || ''
+            }).then(function (d) {
+                msg('Using the network of this PC' +
+                    (d && d.network ? (': pool is now ' + d.network + ', master ' + (d.server_ip || '')) : '') +
+                    ' \\u2713');
+                setEditing(false);
+                return load();
+            }).catch(function (e) { msg(e.message, false); });
+        }
     });
     document.addEventListener('change', function (ev) {
         var row = ev.target.closest ? ev.target.closest('#device-rows .editor-row') : null;
@@ -2415,7 +2961,8 @@ DASHBOARD_JS = """
         api('/api/config/save', {
             server_ip: $('set-server-ip').value.trim(),
             port: $('set-port').value.trim(),
-            target_count: $('set-target').value.trim()
+            target_count: $('set-target').value.trim(),
+            boot_agent: $('set-boot-agent') ? $('set-boot-agent').checked : true
         }).then(afterWrite('global settings saved')).catch(function (e) { msg(e.message, false); });
     });
     $('reload-config').addEventListener('click', function () { setEditing(false); load(); msg('reloaded'); });
@@ -2607,6 +3154,19 @@ def main():
         print(f"   Pool '{pool.name}'{tag}: {pool.network} hosts {pool.start_ip}-{pool.max_ip} "
               f"| GW {pool.gateway} | DNS {pool.dns} | next IP {nxt}")
     print(f" Client Hook Target  : {inventory_mgr.hook_commands()['server']}")
+    boot = "on" if coerce_bool(inventory_mgr.settings.get("boot_agent"), True) else "off"
+    print(f" Boot identity agent : {boot}  (Keep NUCs in sync on every boot)")
+    try:
+        bench = inventory_mgr.bench_status()
+    except Exception as exc:
+        print(f"[!] Bench network check failed: {exc}")
+        bench = {"warnings": [], "networks": []}
+    if bench.get("networks"):
+        print(f" This PC is on       : {describe_networks(bench['networks'])}")
+    else:
+        print(" This PC is on       : (no IPv4 network detected - bench check skipped)")
+    for warning in bench.get("warnings") or []:
+        print(format_startup_warning(warning))
     print("=" * 78)
     print("Waiting for NUCs to connect via Clonezilla / PXE ...\n")
 

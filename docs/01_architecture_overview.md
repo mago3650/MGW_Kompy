@@ -65,12 +65,21 @@ Instead of booting 150 machines into Windows, logging in, writing down keys, and
      computer name that was pinned in the dashboard *while the NUC was imaging* is applied too
      (the pre-run cache is only the fallback when the server cannot be reached).
    - Mounts the newly restored Linux root partition.
-   - Writes the unique static IP into Netplan / NetworkManager / interfaces.
+   - **Neutralises every DHCP source in the image** (netplan, including cloud-init; systemd-networkd;
+     NetworkManager `method=auto`; ifupdown and `interfaces.d`; cloud-init's network stage) and writes
+     a static config matched to this NIC by MAC address. Otherwise the bench router can hand the unit
+     a different address on first boot, and the dashboard assignment never sticks.
    - Sets the assigned hostname in `/etc/hostname` and `/etc/hosts`.
    - **Clears `/etc/machine-id`**: Ensures systemd generates a fresh ID on first boot (prevents DHCP DUID conflicts).
    - Resets SSH host keys.
-   - Reports `CONFIGURED` back to the server.
+   - Optionally installs `mgw-identity.service` (dashboard setting *Keep NUCs in sync on every boot*) so
+     an IP or name changed later is re-applied at the next boot, without re-imaging.
+   - Reports `CONFIGURED` back to the server. The server records the address that check-in came from.
    - Powers off the NUC automatically.
+
+The pool the server allocates from has to be the network the master PC is actually plugged into. If it
+is not, the dashboard banner and the server log say so, and **Use this PC's network** rewrites the
+default pool onto the detected network. See `03_ip_and_network_config.md`.
 
 ---
 
