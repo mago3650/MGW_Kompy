@@ -150,8 +150,12 @@ When prompted for extra parameters, add:
        pinned for this unit in the dashboard.
      - Injects hostname (`nuc-101` to `nuc-120`), or the custom computer name pinned for this unit.
      - Neutralises DHCP in the image and writes the static assignment, matched to this NIC by MAC.
-     - Resets `machine-id`.
-     - Installs the on-boot identity agent when that setting is on.
+       This includes ConnMan, so an AV Linux image needs no modification before capture: the
+       assignment is written as a ConnMan provisioning file plus per-service settings.
+     - Resets `machine-id` and SSH host keys, with first-boot regeneration for both systemd and
+       SysVinit (AV Linux / MX Linux can boot with either).
+     - Installs the on-boot identity agent when that setting is on (as a systemd unit and as a
+       SysVinit rc script; whichever init boots runs it).
      - Shuts down.
 5. The dashboard turns green for all 20 units.
 6. Unplug the 20 finished NUCs, box them, and plug in Batch 2!

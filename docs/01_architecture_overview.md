@@ -66,14 +66,18 @@ Instead of booting 150 machines into Windows, logging in, writing down keys, and
      (the pre-run cache is only the fallback when the server cannot be reached).
    - Mounts the newly restored Linux root partition.
    - **Neutralises every DHCP source in the image** (netplan, including cloud-init; systemd-networkd;
-     NetworkManager `method=auto`; ifupdown and `interfaces.d`; cloud-init's network stage) and writes
-     a static config matched to this NIC by MAC address. Otherwise the bench router can hand the unit
-     a different address on first boot, and the dashboard assignment never sticks.
+     NetworkManager `method=auto`; ifupdown and `interfaces.d`; cloud-init's network stage; and
+     **ConnMan**, the network manager AV Linux / MX Linux ships) and writes a static config matched
+     to this NIC by MAC address. Otherwise the bench router can hand the unit a different address on
+     first boot, and the dashboard assignment never sticks. An AV Linux image is used exactly as
+     captured - nothing in it has to be prepared or changed beforehand.
    - Sets the assigned hostname in `/etc/hostname` and `/etc/hosts`.
-   - **Clears `/etc/machine-id`**: Ensures systemd generates a fresh ID on first boot (prevents DHCP DUID conflicts).
-   - Resets SSH host keys.
-   - Optionally installs `mgw-identity.service` (dashboard setting *Keep NUCs in sync on every boot*) so
-     an IP or name changed later is re-applied at the next boot, without re-imaging.
+   - **Clears `/etc/machine-id`**: a fresh ID is generated on first boot (prevents DHCP DUID
+     conflicts) - by systemd, or by an `mgw-firstboot` SysVinit script on images that boot SysVinit.
+   - Resets SSH host keys (regenerated on first boot under either init system).
+   - Optionally installs the on-boot identity agent (dashboard setting *Keep NUCs in sync on every
+     boot*) as both `mgw-identity.service` and a SysVinit rc script, so an IP or name changed later
+     is re-applied at the next boot whichever init the image boots with, without re-imaging.
    - Reports `CONFIGURED` back to the server. The server records the address that check-in came from.
    - Powers off the NUC automatically.
 

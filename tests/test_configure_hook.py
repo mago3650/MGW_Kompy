@@ -72,6 +72,39 @@ def plant_dhcp_image(root):
     return root
 
 
+def plant_avlinux_image(root):
+    """An AV Linux (MX Linux / Debian) image, exactly as it ships.
+
+    ConnMan owns the wired interface, there is no netplan and no
+    NetworkManager, and the image can boot with systemd or SysVinit.
+    Nothing in the image may be changed before it is captured, so the hook
+    has to cope with all of that on the restored copy.
+    """
+    write(root / "etc/os-release", "ID=mx\nPRETTY_NAME=\"AV Linux MX Edition\"\n")
+    write(root / "etc/hostname", "avlinux\n")
+    write(root / "etc/hosts", "127.0.0.1 localhost\n127.0.1.1 avlinux\n")
+    write(root / "etc/machine-id", "0123456789abcdef0123456789abcdef\n")
+    write(root / "var/lib/dbus/machine-id", "0123456789abcdef0123456789abcdef\n")
+    write(root / "etc/ssh/ssh_host_rsa_key", "SECRET-RSA\n", 0o600)
+    write(root / "etc/ssh/ssh_host_rsa_key.pub", "SECRET-RSA-PUB\n")
+    write(root / "etc/ssh/ssh_host_ed25519_key", "SECRET-ED\n", 0o600)
+    # ConnMan, as shipped: daemon config, a stored DHCP service for this
+    # unit's MAC (as a first DHCP boot on the bench would leave behind),
+    # an ethernet provisioning file cloned from the golden machine (no MAC,
+    # so it would claim the first ethernet interface - this unit's), and a
+    # Wi-Fi provisioning file that is none of this hook's business.
+    write(root / "etc/connman/main.conf", "[General]\n")
+    write(root / "usr/sbin/connmand", "#!/bin/sh\n# fake connmand for detection\n")
+    service = "ethernet_%s_cable" % MAC.replace(":", "")
+    write(root / ("var/lib/connman/%s/settings" % service),
+          "[%s]\nName=Wired\nAutoConnect=true\nIPv4.method=dhcp\n" % service)
+    write(root / "var/lib/connman/bench.config",
+          "[service_bench]\nType = ethernet\nIPv4 = dhcp\n")
+    write(root / "var/lib/connman/home-wifi.config",
+          "[service_home_wifi]\nType = wifi\nName = home\nIPv4 = dhcp\n")
+    return root
+
+
 def run_hook(root, mode="image", extra=None, assignment=None):
     cfg = root / "assignment.json"
     cfg.write_text(json.dumps(assignment or ASSIGNMENT))
@@ -218,10 +251,23 @@ def test_boot_agent_install_and_uninstall():
         assert "DEPLOY_MAC=%s" % MAC in text
         assert (root / "usr/local/sbin/mgw-configure-network.sh").is_file()
 
+        # the SysVinit twin rides along: same script, rc links in 2-5
+        sysv = root / "etc/init.d/mgw-identity"
+        assert sysv.is_file() and os.access(sysv, os.X_OK)
+        assert "/usr/local/sbin/mgw-identity.sh" in sysv.read_text()
+        assert "/run/systemd/system" in sysv.read_text()  # inert under systemd
+        for level in (2, 3, 4, 5):
+            link = root / ("etc/rc%d.d/S99mgw-identity" % level)
+            assert link.is_symlink(), link
+            assert os.readlink(link) == "../init.d/mgw-identity"
+
         proc = run_hook(root, mode="live", extra={"DEPLOY_BOOT_AGENT": "0"})
         assert proc.returncode == 0, proc.stdout + proc.stderr
         for path in (agent, unit, wants, conf, root / "usr/local/sbin/mgw-configure-network.sh"):
             assert not path.exists(), path
+        assert not sysv.exists()
+        for level in (2, 3, 4, 5):
+            assert not (root / ("etc/rc%d.d/S99mgw-identity" % level)).exists()
         # uninstalling the agent must not undo the assignment
         assert "192.168.169.101/24" in (root / "etc/netplan/01-mgw-static.yaml").read_text()
     finally:
@@ -265,6 +311,9 @@ def test_live_mode_never_touches_machine_id_or_ssh_keys():
             assert raw == data
         # the regen-ssh unit is an image-mode artefact and must not appear
         assert not (root / "etc/systemd/system/regenerate-ssh-keys.service").exists()
+        # ...and neither may its SysVinit twin
+        assert not (root / "etc/init.d/mgw-firstboot").exists()
+        assert not (root / "etc/rcS.d/S01mgw-firstboot").exists()
     finally:
         shutil.rmtree(root)
 
@@ -280,6 +329,16 @@ def test_image_mode_resets_identity_and_dry_run_writes_nothing():
         assert not (root / "etc/ssh/ssh_host_rsa_key").exists()
         assert not (root / "etc/ssh/ssh_host_ed25519_key").exists()
         assert (root / "etc/systemd/system/regenerate-ssh-keys.service").is_file()
+        # SysVinit twin: regenerates machine-id + SSH keys when systemd is
+        # not PID 1, and stays out of the way when it is
+        firstboot = root / "etc/init.d/mgw-firstboot"
+        assert firstboot.is_file() and os.access(firstboot, os.X_OK)
+        body = firstboot.read_text()
+        assert "/etc/machine-id" in body and "ssh-keygen -A" in body
+        assert "/run/systemd/system" in body
+        rc_link = root / "etc/rcS.d/S01mgw-firstboot"
+        assert rc_link.is_symlink()
+        assert os.readlink(rc_link) == "../init.d/mgw-firstboot"
 
         # a second image, this time a dry run, must not be touched at all
         other = Path(tempfile.mkdtemp())
@@ -296,6 +355,90 @@ def test_image_mode_resets_identity_and_dry_run_writes_nothing():
         snapshot.pop(Path("assignment.json"), None)
         assert after == snapshot
         shutil.rmtree(other)
+    finally:
+        shutil.rmtree(root)
+
+
+def test_avlinux_connman_gets_the_static_assignment():
+    root = Path(tempfile.mkdtemp())
+    try:
+        plant_avlinux_image(root)
+        proc = run_hook(root, mode="image")
+        assert proc.returncode == 0, proc.stdout + proc.stderr
+
+        # provisioning file, matched to this unit's NIC by MAC
+        config = (root / "var/lib/connman/mgwstatic.config").read_text()
+        assert "[service_mgw_wired]" in config
+        assert "Type = ethernet" in config
+        assert "MAC = %s" % MAC in config
+        assert "IPv4 = 192.168.169.101/24/192.168.169.254" in config
+        assert "IPv6 = off" in config
+        assert "Nameservers = 1.1.1.1,8.8.8.8" in config
+
+        # stored per-service state, as `connmanctl config --ipv4 manual`
+        # would leave it: the first boot is static before provisioning
+        service = "ethernet_%s_cable" % MAC.replace(":", "")
+        settings = (root / ("var/lib/connman/%s/settings" % service)).read_text()
+        assert "IPv4.method=manual" in settings
+        assert "IPv4.local_address=192.168.169.101" in settings
+        assert "IPv4.netmask_prefixlen=24" in settings
+        assert "IPv4.gateway=192.168.169.254" in settings
+        assert "IPv6.method=off" in settings
+        assert "Nameservers=1.1.1.1;8.8.8.8;" in settings
+        assert "dhcp" not in settings
+
+        # the cloned ethernet provisioning file must not claim this NIC,
+        # the Wi-Fi one is left alone
+        assert not (root / "var/lib/connman/bench.config").exists()
+        assert (root / "var/lib/connman/mgw-backup/bench.config").is_file()
+        assert (root / "var/lib/connman/home-wifi.config").is_file()
+
+        # ConnMan owns the interface: no netplan file nobody would read,
+        # and no ifupdown stanza fighting ConnMan for the same NIC
+        assert not (root / "etc/netplan/01-mgw-static.yaml").exists()
+        assert not (root / "etc/network/interfaces").exists()
+
+        assert (root / "etc/hostname").read_text().strip() == "nuc-101"
+    finally:
+        shutil.rmtree(root)
+
+
+def test_avlinux_dual_init_boot_agent_and_idempotency():
+    root = Path(tempfile.mkdtemp())
+    try:
+        plant_avlinux_image(root)
+        proc = run_hook(root, mode="image", extra={
+            "DEPLOY_BOOT_AGENT": "1",
+            "DEPLOY_SERVER": "192.168.169.250",
+            "DEPLOY_PORT": "8000",
+        })
+        assert proc.returncode == 0, proc.stdout + proc.stderr
+
+        # AV Linux can boot either init, so both doors are installed:
+        # the systemd unit and the SysVinit rc script, each inert under
+        # the other init.
+        unit = root / "etc/systemd/system/mgw-identity.service"
+        wants = root / "etc/systemd/system/multi-user.target.wants/mgw-identity.service"
+        assert unit.is_file() and wants.is_symlink()
+        sysv = root / "etc/init.d/mgw-identity"
+        assert sysv.is_file() and os.access(sysv, os.X_OK)
+        for level in (2, 3, 4, 5):
+            assert (root / ("etc/rc%d.d/S99mgw-identity" % level)).is_symlink()
+        # cloned identity is reset for both inits too
+        assert (root / "etc/init.d/mgw-firstboot").is_file()
+        assert (root / "etc/rcS.d/S01mgw-firstboot").is_symlink()
+
+        # re-applying live (what the boot agent does) changes nothing twice
+        first = run_hook(root, mode="live", extra={"DEPLOY_BOOT_AGENT": "1",
+                                                   "DEPLOY_SERVER": "192.168.169.250"})
+        assert first.returncode == 0, first.stdout + first.stderr
+        second = run_hook(root, mode="live", extra={"DEPLOY_BOOT_AGENT": "1",
+                                                    "DEPLOY_SERVER": "192.168.169.250"})
+        assert second.returncode == 0, second.stdout + second.stderr
+        assert "files changed: 0" in second.stdout, second.stdout
+        # and the ConnMan assignment survived the live re-apply
+        assert "IPv4 = 192.168.169.101/24/192.168.169.254" in \
+            (root / "var/lib/connman/mgwstatic.config").read_text()
     finally:
         shutil.rmtree(root)
 
