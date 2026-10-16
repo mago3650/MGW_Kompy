@@ -21,7 +21,14 @@ Directly after the Clonezilla image is written to the NUC's NVMe drive, `configu
    truncate -s 0 /mnt/target/etc/machine-id
    rm -f /mnt/target/var/lib/dbus/machine-id
    ```
-   On first boot, systemd automatically detects the empty file and generates a brand-new, globally unique machine ID for each NUC.
+   On first boot a brand-new, globally unique machine ID is generated for each NUC. Under
+   systemd, PID 1 does that itself (and `regenerate-ssh-keys.service` recreates the deleted SSH
+   host keys). An image that boots **SysVinit** - AV Linux / MX Linux can boot either init - has
+   no systemd to do it, so the hook also installs `/etc/init.d/mgw-firstboot` (linked from
+   `rcS.d`, before D-Bus/elogind/ssh start): it generates the machine-id from the kernel UUID,
+   restores `/var/lib/dbus/machine-id` to match, and runs `ssh-keygen -A`. It exits immediately
+   when systemd is running (`/run/systemd/system` exists) and is a no-op on every later boot,
+   so one image works whichever init the operator picks in the boot menu.
 5. Injects the static network configuration according to the distribution's network stack:
 
 ### Case A: Netplan (Ubuntu Server/Desktop & modern Debian)
@@ -57,6 +64,7 @@ The same hook also disables the other DHCP sources a cloned image commonly still
 | ifupdown | `inet dhcp` stanzas are stripped from `/etc/network/interfaces` |
 | `interfaces.d` | Snippets that still say `inet dhcp` are moved to `interfaces.d/mgw-backup/` |
 | cloud-init | `/etc/cloud/cloud.cfg.d/99-mgw-disable-network.cfg` sets `network: {config: disabled}` so cloud-init cannot write a DHCP netplan back on boot |
+| ConnMan | A static provisioning file and per-service settings are written (Case C below). Any other ethernet provisioning file cloned from the golden image is moved to `var/lib/connman/mgw-backup/` so it cannot claim this unit's NIC; Wi-Fi provisioning is left alone |
 
 ### Case B: NetworkManager Keyfile (Fedora, Rocky Linux, RHEL, Ubuntu Desktop)
 Creates `/etc/NetworkManager/system-connections/mgw-static.nmconnection`:
@@ -77,6 +85,52 @@ dns=1.1.1.1;8.8.8.8;
 [ipv6]
 method=ignore
 ```
+
+### Case C: ConnMan (AV Linux / MX Linux) - no image changes needed
+
+AV Linux manages networking with **ConnMan**, which reads none of the formats above, and it can
+boot with **systemd or SysVinit**. The image is therefore used exactly as captured; when the
+hook finds ConnMan in the restored root (`/var/lib/connman`, `/etc/connman` or the `connmand`
+binary) it writes the assignment twice, both matched to the unit's NIC by MAC address:
+
+1. A provisioning file `/var/lib/connman/mgwstatic.config` (letters only in the file name -
+   ConnMan rejects anything else), in `connman-service.config(5)` format:
+   ```ini
+   [service_mgw_wired]
+   Type = ethernet
+   MAC = aa:bb:cc:dd:ee:01
+   IPv4 = 192.168.169.101/24/192.168.169.254
+   IPv6 = off
+   Nameservers = 1.1.1.1,8.8.8.8
+   ```
+   ConnMan re-applies this file when it changes, which is how a dashboard edit lands on a unit
+   that is already deployed.
+2. The stored per-service state `/var/lib/connman/ethernet_<mac>_cable/settings` - the same
+   file `connmanctl config ... --ipv4 manual` would write - so the very first boot is already
+   static, before any provisioning round-trip:
+   ```ini
+   [ethernet_aabbccddee01_cable]
+   Name=Wired
+   AutoConnect=true
+   IPv4.method=manual
+   IPv4.netmask_prefixlen=24
+   IPv4.local_address=192.168.169.101
+   IPv4.gateway=192.168.169.254
+   IPv6.method=off
+   Nameservers=1.1.1.1;8.8.8.8;
+   ```
+
+While ConnMan is present the hook does **not** create a netplan file (nothing on AV Linux would
+read it) and does not add an ifupdown static stanza (ifupdown would fight ConnMan for the same
+interface); ifupdown DHCP stanzas are still stripped.
+
+The on-boot identity agent is likewise installed for both init systems: the systemd unit
+`mgw-identity.service` **and** `/etc/init.d/mgw-identity` linked as `S99mgw-identity` in
+runlevels 2-5. Each checks for `/run/systemd/system` and stays inert under the other init, so
+an operator choosing either entry in the AV Linux boot menu still gets dashboard edits at the
+next boot. Because SysVinit has no `network-online.target`, the agent script itself now waits
+(up to ~15 s) for the dashboard to answer before fetching the assignment.
+
 
 ---
 
@@ -353,8 +407,9 @@ Why it happens:
   lease. `configure_network.sh` now moves netplan files (including cloud-init's) to
   `/etc/netplan/mgw-backup`, disables systemd-networkd `DHCP=yes` profiles, sets NetworkManager
   `autoconnect=false` on `method=auto` profiles, strips ifupdown DHCP stanzas, neutralises
-  `interfaces.d` snippets, and disables cloud-init's network stage. The static file matches the NIC
-  by MAC, not by `en*`.
+  `interfaces.d` snippets, disables cloud-init's network stage, and - on AV Linux / MX Linux -
+  writes the static assignment in ConnMan's own format (Case C) and moves any cloned ethernet
+  provisioning file aside. The static file matches the NIC by MAC, not by `en*`.
 * The pool was a different network from the bench, so the "assigned" address was never reachable.
   Adopt this PC's network (section above) and re-image, or edit the unit.
 * The router still owns the same range. Exclude it, or isolate the switch.
@@ -376,7 +431,9 @@ With **Keep NUCs in sync on every boot** left on, the post-run hook installs:
 
 * `/etc/mgw-deploy.conf` — server address, MAC, interface
 * `/usr/local/sbin/mgw-identity.sh` — downloads the current hook and runs it in live mode
-* `mgw-identity.service` — oneshot, `network-online.target`
+* `mgw-identity.service` — oneshot, `network-online.target` (systemd boots)
+* `/etc/init.d/mgw-identity` + `S99mgw-identity` links in runlevels 2-5 (SysVinit boots, e.g. an
+  AV Linux image started with the SysVinit boot-menu entry; inert when systemd is PID 1)
 
 An IP or computer name changed in the dashboard then lands at the next boot. Turn the setting off
-and the next boot's downloaded script removes the agent (`DEPLOY_BOOT_AGENT=0`).
+and the next boot's downloaded script removes the agent - both flavours (`DEPLOY_BOOT_AGENT=0`).

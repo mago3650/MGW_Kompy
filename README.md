@@ -6,9 +6,14 @@ Automated high-speed deployment pipeline for **150 Intel NUC computers**:
 - **Assigns unique static IP addresses and hostnames** automatically to every machine - and lets you
   **pin an exact IP and a custom computer name to any single NUC** (before or after it boots).
 - **Stops DHCP from stealing that address.** The post-run hook neutralises netplan, systemd-networkd,
-  NetworkManager, ifupdown and cloud-init DHCP in the cloned image, and can install an on-boot agent
-  so a later dashboard edit lands at the next boot.
-- **Wipes `/etc/machine-id` and resets SSH keys** to eliminate network ID conflicts.
+  NetworkManager, ifupdown, cloud-init and **ConnMan** DHCP in the cloned image, and can install an
+  on-boot agent so a later dashboard edit lands at the next boot.
+- **Works with an unmodified AV Linux image.** AV Linux (MX Linux / Debian) manages networking with
+  ConnMan and can boot with systemd **or** SysVinit. The hook detects both at restore time and writes
+  every configuration in the format that stack actually reads - the Clonezilla image itself does not
+  need to be changed in any way (details in `docs/03_ip_and_network_config.md`).
+- **Wipes `/etc/machine-id` and resets SSH keys** to eliminate network ID conflicts - regenerated on
+  first boot under either init system.
 - **Live Web Dashboard & CSV export** to monitor progress and archive license keys.
 
 ---
@@ -171,7 +176,7 @@ in the URL forces it for one visit.
 Sanity-check the pool, naming and pinning logic without any hardware:
 ```bash
 python3 tests/test_network_config.py     # 28 checks, stdlib only (also runs under pytest)
-python3 tests/test_configure_hook.py     # 6 hook checks: DHCP neutralisation, agent, idempotency
+python3 tests/test_configure_hook.py     # 8 hook checks: DHCP neutralisation, agent, idempotency, AV Linux (ConnMan + SysVinit)
 ```
 
 ### Step 3: Launch Clonezilla Lite Server (Multicast PXE)
@@ -182,7 +187,11 @@ python3 tests/test_configure_hook.py     # 6 hook checks: DHCP neutralisation, a
    addresses out once the NUCs boot the restored image. FileZilla (if you use it to copy images) is
    an FTP server: it has no DHCP and no IP pool. The address a deployed NUC keeps comes from the
    image, which is why the post-run hook has to remove every DHCP source it finds.
-4. Select your Linux image from your storage device.
+4. Select your Linux image from your storage device. An **AV Linux** image is used exactly as
+   captured - do not switch its network manager or its default init system first. The post-run
+   hook speaks ConnMan and installs its first-boot helpers for both systemd and SysVinit, so
+   whichever way the unmodified image boots, the assigned IP/hostname land and a later dashboard
+   edit still reaches the unit.
 5. Target disk: `nvme0n1` (or `sda`).
 6. Mode: **`multicast`** -> client wait: **`20`** (or wait-time: `180` seconds).
 7. In Expert options, add the hooks:

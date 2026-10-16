@@ -7,10 +7,17 @@
 #   1. Mounts the restored Linux root (or uses DEPLOY_TARGET_ROOT).
 #   2. Applies the assigned static IP, gateway, DNS and hostname.
 #   3. Neutralises every DHCP source in the cloned image so the bench router
-#      cannot hand the unit a different address on first boot.
+#      cannot hand the unit a different address on first boot. Handles netplan,
+#      systemd-networkd, NetworkManager, ifupdown, cloud-init and ConnMan
+#      (the network manager AV Linux / MX Linux ships), so an AV Linux image
+#      needs no modification before it is captured with Clonezilla.
 #   4. Resets /etc/machine-id and SSH host keys (cloned identity must not leak).
+#      First-boot regeneration is installed for both systemd and SysVinit,
+#      because AV Linux / MX Linux can boot with either init system.
 #   5. Optionally installs an on-boot identity agent so a later dashboard edit
-#      lands the next time the unit powers on.
+#      lands the next time the unit powers on. The agent is installed as a
+#      systemd unit and as a SysVinit rc script; whichever init the image
+#      boots with runs it, the other one is inert.
 #
 # Live mode (DEPLOY_MODE=live) — re-apply on a unit that is already deployed:
 #   Same network/hostname/DHCP work, idempotent ("files changed: 0" when the
@@ -229,7 +236,7 @@ rm -f "$HOSTS_TMP"
 
 # ---------------------------------------------------------------- cloned identity (image mode only)
 reset_cloned_identity() {
-    echo "[*] Resetting systemd machine-id..."
+    echo "[*] Resetting machine-id (regenerated on first boot, systemd or SysVinit)..."
     if [ "$APPLY" = "1" ]; then
         if [ -f "$ROOT/etc/machine-id" ] && [ ! -s "$ROOT/etc/machine-id" ]; then
             :
@@ -272,6 +279,61 @@ WantedBy=multi-user.target
 EOF
     ensure_link /etc/systemd/system/regenerate-ssh-keys.service \
         "$ROOT/etc/systemd/system/multi-user.target.wants/regenerate-ssh-keys.service"
+
+    # SysVinit twin of the systemd unit above. AV Linux / MX Linux images can
+    # boot with either init; under SysVinit the systemd unit never runs, so
+    # without this script the wiped machine-id stays empty and the deleted
+    # SSH host keys are never regenerated (sshd then has no keys to start
+    # with). It runs from rcS.d, before D-Bus/elogind/ssh in rc2.d, and is a
+    # no-op under systemd (/run/systemd/system exists there, and PID 1 plus
+    # regenerate-ssh-keys.service already did the work) and on later boots.
+    write_file "$ROOT/etc/init.d/mgw-firstboot" 755 << 'EOF'
+#!/bin/sh
+### BEGIN INIT INFO
+# Provides:          mgw-firstboot
+# Required-Start:    $local_fs
+# Required-Stop:
+# Default-Start:     S
+# Default-Stop:
+# Short-Description: MGW Kompy first-boot identity reset (SysVinit)
+# Description:       Generates a fresh /etc/machine-id and SSH host keys on
+#                    images cloned by MGW_Kompy when booting with SysVinit.
+#                    No-op under systemd and after the first successful run.
+### END INIT INFO
+
+case "$1" in
+    start|restart|force-reload) ;;
+    *) exit 0 ;;
+esac
+
+# systemd is PID 1: it generated the machine-id itself and the
+# regenerate-ssh-keys.service unit handles the SSH keys. Do nothing.
+[ -d /run/systemd/system ] && exit 0
+
+if [ ! -s /etc/machine-id ]; then
+    MGW_NEW_ID=""
+    if [ -r /proc/sys/kernel/random/uuid ]; then
+        MGW_NEW_ID=$(tr -d '\n-' < /proc/sys/kernel/random/uuid)
+    fi
+    if [ -z "$MGW_NEW_ID" ] && command -v dbus-uuidgen >/dev/null 2>&1; then
+        MGW_NEW_ID=$(dbus-uuidgen)
+    fi
+    if [ -n "$MGW_NEW_ID" ]; then
+        printf '%s\n' "$MGW_NEW_ID" > /etc/machine-id
+        # The hook deleted /var/lib/dbus/machine-id; keep D-Bus in agreement.
+        if [ -d /var/lib/dbus ] && [ ! -e /var/lib/dbus/machine-id ]; then
+            printf '%s\n' "$MGW_NEW_ID" > /var/lib/dbus/machine-id
+        fi
+    fi
+fi
+
+if [ ! -f /etc/ssh/ssh_host_rsa_key ] && command -v ssh-keygen >/dev/null 2>&1; then
+    ssh-keygen -A >/dev/null 2>&1 || true
+fi
+exit 0
+EOF
+    ensure_link ../init.d/mgw-firstboot \
+        "$ROOT/etc/rcS.d/S01mgw-firstboot"
 }
 
 if [ "$DEPLOY_MODE" != "live" ]; then
@@ -286,10 +348,21 @@ echo "[*] Neutralising DHCP and writing the static assignment..."
 YAML_DNS=$(echo "$DNS_SERVERS" | awk -F',' '{for(i=1;i<=NF;i++){gsub(/^[ \t]+|[ \t]+$/, "", $i); if ($i != "") printf "\"%s\"%s", $i, (i==NF?"":", ")}}')
 [ -z "$YAML_DNS" ] && YAML_DNS='"1.1.1.1", "8.8.8.8"'
 DNS_SEMI=$(echo "$DNS_SERVERS" | sed 's/ //g' | tr ',' ';')
+DNS_COMMA=$(echo "$DNS_SERVERS" | sed 's/ //g')
 DNS_SPACED=$(echo "$DNS_SERVERS" | sed 's/,/ /g' | tr -s ' ')
 
+# Stack detection. ConnMan is the network manager AV Linux / MX Linux ships;
+# when it is present it owns the wired interface, so the assignment must be
+# written in ConnMan's own format (section 6) and the netplan/ifupdown
+# fallbacks must not grow a competing configuration for the same NIC.
+CONNMAN_PRESENT=0
+if [ -d "$ROOT/var/lib/connman" ] || [ -d "$ROOT/etc/connman" ] \
+    || [ -e "$ROOT/usr/sbin/connmand" ] || [ -e "$ROOT/usr/bin/connmanctl" ]; then
+    CONNMAN_PRESENT=1
+fi
+
 # --- 1. netplan (Ubuntu / modern Debian, including cloud-init) -----------------
-if [ -d "$ROOT/etc/netplan" ] || { [ ! -d "$ROOT/etc/NetworkManager/system-connections" ] && [ ! -f "$ROOT/etc/network/interfaces" ]; }; then
+if [ -d "$ROOT/etc/netplan" ] || { [ "$CONNMAN_PRESENT" != "1" ] && [ ! -d "$ROOT/etc/NetworkManager/system-connections" ] && [ ! -f "$ROOT/etc/network/interfaces" ]; }; then
     if [ "$APPLY" = "1" ]; then
         mkdir -p "$ROOT/etc/netplan/mgw-backup"
     fi
@@ -414,9 +487,10 @@ strip_ifupdown_dhcp() {
 
 if [ -f "$ROOT/etc/network/interfaces" ]; then
     strip_ifupdown_dhcp "$ROOT/etc/network/interfaces"
-    # A netplan/NM image must not also grow a second static stanza. ifupdown-only
-    # images get the assignment here, matched to this NIC via hwaddress.
-    if [ ! -d "$ROOT/etc/netplan" ] && [ ! -d "$ROOT/etc/NetworkManager/system-connections" ]; then
+    # A netplan/NM/ConnMan image must not also grow a second static stanza.
+    # ifupdown-only images get the assignment here, matched to this NIC via
+    # hwaddress.
+    if [ "$CONNMAN_PRESENT" != "1" ] && [ ! -d "$ROOT/etc/netplan" ] && [ ! -d "$ROOT/etc/NetworkManager/system-connections" ]; then
         if ! grep -q "address ${ASSIGNED_IP}" "$ROOT/etc/network/interfaces" 2>/dev/null; then
             IF_TMP=$(mktemp)
             cat "$ROOT/etc/network/interfaces" > "$IF_TMP"
@@ -461,6 +535,75 @@ write_file "$ROOT/etc/cloud/cloud.cfg.d/99-mgw-disable-network.cfg" 644 << 'EOF'
 network: {config: disabled}
 EOF
 
+# --- 6. ConnMan (AV Linux / MX Linux) -------------------------------------------
+# AV Linux manages networking with ConnMan, which reads none of the files
+# above. Two complementary files are written, both matched to this unit's
+# NIC by MAC address (see connman-service.config(5)):
+#   * mgwstatic.config - a provisioning file. ConnMan applies it to the
+#     service for this MAC and re-applies it live when the file changes,
+#     which is what makes a dashboard edit land on an already-booted unit.
+#     (No hyphen in the file name: ConnMan only accepts letters and numbers
+#     in provisioning file names.)
+#   * ethernet_<mac>_cable/settings - the stored per-service state, the
+#     same file `connmanctl config ... --ipv4 manual` would write, so the
+#     very first boot (before any provisioning round-trip) is static too.
+# Any other ethernet provisioning file cloned from the golden image is
+# moved aside first: one without a MAC entry would otherwise claim the
+# first ethernet interface it finds - this unit's - with the wrong address
+# or with DHCP. Wi-Fi provisioning files are left alone.
+if [ "$CONNMAN_PRESENT" = "1" ]; then
+    echo "[*] ConnMan detected - writing the static assignment for ConnMan..."
+    if [ "$APPLY" = "1" ]; then
+        mkdir -p "$ROOT/var/lib/connman/mgw-backup"
+    fi
+    for f in "$ROOT"/var/lib/connman/*.config; do
+        [ -f "$f" ] || continue
+        base=$(basename "$f")
+        [ "$base" = "mgwstatic.config" ] && continue
+        if grep -Eq '^[[:space:]]*Type[[:space:]]*=[[:space:]]*ethernet[[:space:]]*$' "$f" \
+            && grep -Eq '^[[:space:]]*IPv4[[:space:]]*=' "$f"; then
+            echo "[*] Moving ConnMan ethernet provisioning $base aside (it must not claim this NIC)"
+            move_aside "$f" "$ROOT/var/lib/connman/mgw-backup/$base"
+        fi
+    done
+
+    if [ -n "$MAC_ADDR" ]; then
+        CONNMAN_MATCH_LINE=$(printf 'MAC = %s' "$MAC_ADDR")
+    else
+        CONNMAN_MATCH_LINE=$(printf 'DeviceName = %s' "${NET_IFACE:-eth0}")
+    fi
+    write_file "$ROOT/var/lib/connman/mgwstatic.config" 600 << EOF
+# Written by MGW_Kompy. Static assignment for this unit's wired NIC.
+[global]
+Name = mgw-static
+Description = Static IP assigned by MGW_Kompy
+
+[service_mgw_wired]
+Type = ethernet
+${CONNMAN_MATCH_LINE}
+IPv4 = ${ASSIGNED_IP}/${CIDR}/${GATEWAY}
+IPv6 = off
+Nameservers = ${DNS_COMMA}
+EOF
+
+    if [ -n "$MAC_ADDR" ]; then
+        CONNMAN_SERVICE="ethernet_$(printf '%s' "$MAC_ADDR" | tr -d ':')_cable"
+        write_file "$ROOT/var/lib/connman/${CONNMAN_SERVICE}/settings" 600 << EOF
+[${CONNMAN_SERVICE}]
+Name=Wired
+AutoConnect=true
+Favorite=true
+IPv4.method=manual
+IPv4.netmask_prefixlen=${CIDR}
+IPv4.local_address=${ASSIGNED_IP}
+IPv4.gateway=${GATEWAY}
+IPv6.method=off
+IPv6.privacy=disabled
+Nameservers=${DNS_SEMI};
+EOF
+    fi
+fi
+
 # ---------------------------------------------------------------- on-boot agent
 install_boot_agent() {
     echo "[*] Installing on-boot identity agent (dashboard edits apply at next boot)..."
@@ -487,6 +630,21 @@ export DEPLOY_MODE=live
 # setting instead of uninstalling this agent on every boot.
 unset DEPLOY_BOOT_AGENT
 export DEPLOY_SERVER DEPLOY_PORT DEPLOY_MAC DEPLOY_IFACE DEPLOY_POOL
+# SysVinit has no network-online.target and ConnMan applies the wired
+# address asynchronously, so give the network a moment to come up before
+# the configure script tries to fetch this unit's assignment. Under
+# systemd (After=network-online.target) the server answers at once.
+if [ -n "${DEPLOY_SERVER:-}" ] && command -v curl >/dev/null 2>&1; then
+    MGW_TRIES=0
+    while [ "$MGW_TRIES" -lt 15 ]; do
+        if curl -fsS --max-time 2 --connect-timeout 1 \
+            "http://${DEPLOY_SERVER}:${DEPLOY_PORT:-8000}/" >/dev/null 2>&1; then
+            break
+        fi
+        MGW_TRIES=$((MGW_TRIES + 1))
+        sleep 1
+    done
+fi
 CACHED=/usr/local/sbin/mgw-configure-network.sh
 SCRIPT="$CACHED"
 if [ -n "${DEPLOY_SERVER:-}" ] && command -v curl >/dev/null 2>&1; then
@@ -530,12 +688,55 @@ WantedBy=multi-user.target
 EOF
     ensure_link /etc/systemd/system/mgw-identity.service \
         "$ROOT/etc/systemd/system/multi-user.target.wants/mgw-identity.service"
+
+    # SysVinit twin of the systemd unit above. AV Linux / MX Linux can boot
+    # with either init, and a SysVinit boot never looks at systemd units, so
+    # without this rc script dashboard edits would only ever land on units
+    # that happen to boot systemd. It is a no-op under systemd
+    # (/run/systemd/system exists there, and the native unit already ran),
+    # and S99 + Required-Start: $network put it after ConnMan/ifupdown.
+    write_file "$ROOT/etc/init.d/mgw-identity" 755 << 'EOF'
+#!/bin/sh
+### BEGIN INIT INFO
+# Provides:          mgw-identity
+# Required-Start:    $network $remote_fs $syslog
+# Required-Stop:
+# Default-Start:     2 3 4 5
+# Default-Stop:
+# Short-Description: MGW Kompy identity agent (SysVinit)
+# Description:       Re-applies this unit's dashboard IP and hostname at
+#                    boot when running under SysVinit. No-op under systemd,
+#                    where mgw-identity.service does the same job.
+### END INIT INFO
+
+case "$1" in
+    start) ;;
+    *) exit 0 ;;
+esac
+
+# systemd is PID 1: mgw-identity.service already handled this boot.
+[ -d /run/systemd/system ] && exit 0
+
+[ -x /usr/local/sbin/mgw-identity.sh ] || exit 0
+/usr/local/sbin/mgw-identity.sh || true
+exit 0
+EOF
+    local runlevel
+    for runlevel in 2 3 4 5; do
+        ensure_link ../init.d/mgw-identity \
+            "$ROOT/etc/rc${runlevel}.d/S99mgw-identity"
+    done
 }
 
 uninstall_boot_agent() {
     echo "[*] Removing on-boot identity agent..."
     remove_path "$ROOT/etc/systemd/system/multi-user.target.wants/mgw-identity.service"
     remove_path "$ROOT/etc/systemd/system/mgw-identity.service"
+    local runlevel
+    for runlevel in 2 3 4 5; do
+        remove_path "$ROOT/etc/rc${runlevel}.d/S99mgw-identity"
+    done
+    remove_path "$ROOT/etc/init.d/mgw-identity"
     remove_path "$ROOT/usr/local/sbin/mgw-identity.sh"
     remove_path "$ROOT/usr/local/sbin/mgw-configure-network.sh"
     remove_path "$ROOT/etc/mgw-deploy.conf"
