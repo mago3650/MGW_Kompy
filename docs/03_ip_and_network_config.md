@@ -25,37 +25,53 @@ Directly after the Clonezilla image is written to the NUC's NVMe drive, `configu
 5. Injects the static network configuration according to the distribution's network stack:
 
 ### Case A: Netplan (Ubuntu Server/Desktop & modern Debian)
-Creates `/etc/netplan/01-static-ip.yaml`:
+Every existing netplan file, including cloud-init's `50-cloud-init.yaml`, is moved to
+`/etc/netplan/mgw-backup/` and replaced by `/etc/netplan/01-mgw-static.yaml`. The NIC is matched by
+MAC address, not by a name glob, so a renamed interface still gets the assignment:
+
 ```yaml
 network:
   version: 2
   renderer: networkd
   ethernets:
-    wired-all:
+    mgw-wired:
       match:
-        name: "en*"
+        macaddress: "aa:bb:cc:dd:ee:01"
       dhcp4: false
       dhcp6: false
       addresses:
-        - 192.168.1.105/24
+        - 192.168.169.101/24
       routes:
         - to: default
-          via: 192.168.1.1
+          via: 192.168.169.254
       nameservers:
         addresses: ["1.1.1.1", "8.8.8.8"]
 ```
 
+The same hook also disables the other DHCP sources a cloned image commonly still has:
+
+| Stack | What the hook does |
+|---|---|
+| systemd-networkd | Any `*.network` with `DHCP=yes` is renamed to `*.network.disabled` |
+| NetworkManager | Profiles with `method=auto` get `autoconnect=false`. A `mgw-static.nmconnection` (method=manual, matched by MAC) is added when that directory exists |
+| ifupdown | `inet dhcp` stanzas are stripped from `/etc/network/interfaces` |
+| `interfaces.d` | Snippets that still say `inet dhcp` are moved to `interfaces.d/mgw-backup/` |
+| cloud-init | `/etc/cloud/cloud.cfg.d/99-mgw-disable-network.cfg` sets `network: {config: disabled}` so cloud-init cannot write a DHCP netplan back on boot |
+
 ### Case B: NetworkManager Keyfile (Fedora, Rocky Linux, RHEL, Ubuntu Desktop)
-Creates `/etc/NetworkManager/system-connections/static-wired.nmconnection`:
+Creates `/etc/NetworkManager/system-connections/mgw-static.nmconnection`:
 ```ini
 [connection]
-id=static-wired
+id=mgw-static
 type=ethernet
 autoconnect=true
 
+[ethernet]
+mac-address=AA:BB:CC:DD:EE:01
+
 [ipv4]
 method=manual
-addresses1=192.168.1.105;24;192.168.1.1;
+address1=192.168.169.101/24,192.168.169.254
 dns=1.1.1.1;8.8.8.8;
 
 [ipv6]
@@ -237,6 +253,20 @@ Reserve an exact IP + computer name for a MAC that has not booted yet (this is t
 `gateway`, `netmask` and `dns` are derived from the pool that owns the address (they can be sent
 explicitly for an address outside every pool). Removing a reservation frees the address again.
 
+### `GET /api/bench` / `POST /api/bench/adopt`
+`GET /api/bench` reports the IPv4 networks detected on this PC (`ip -4 -o addr`, then ioctl;
+gateway from `ip route`, then `/proc/net/route`) and a `warnings` list when a configured pool is not
+one of those networks. `POST /api/bench/adopt` with
+
+```json
+{"address": "192.168.169.250", "prefix": 24, "gateway": "192.168.169.254"}
+```
+
+rewrites the **default** pool onto that network: subnet, gateway, cursor and the master/server IP.
+The old range numbers (101–250) are kept when they still fit. The gateway and this PC's own address
+are reserved, so they are never handed to a NUC. The result is persisted to `network_config.json`.
+This is the **Use this PC's network** button. Already-registered units keep the addresses they have.
+
 ### `GET /api/dashboard`
 The fragment endpoint the auto-refresh toggle uses - it returns the same numbers/tables the page was
 rendered with, so the tables can be updated without reloading:
@@ -244,8 +274,16 @@ rendered with, so the tables can be updated without reloading:
 {"stats": {"total": 12, "target": 150, "keys_found": 5, "completed": 3, "pinned": 2, "pools": 2,
            "default_pool": "office", "progress_total": 8.0, "progress_keys": 41.7, "progress_completed": 25.0},
  "pool_cards": "<div class=\"col-md-4 ...\">...</div>", "rows": "<tr>...</tr>",
- "predefined_rows": "<tr>...</tr>", "predefined": [ ... ]}
+ "predefined_rows": "<tr>...</tr>", "predefined": [ ... ],
+ "banners": "<div class=\"alert ...\">...</div>",
+ "bench": {"ok": false, "networks": [ ... ], "warnings": [ "Pool 'default' uses ..." ], "primary": { ... }},
+ "mismatches": [{"hostname": "nuc-101", "assigned_ip": "192.168.100.101", "seen_ip": "192.168.169.45"}]}
 ```
+
+`banners` is the bench warning plus any "checked in from the wrong address" warning, so auto-refresh
+can replace them in place. `seen_ip` / `seen_at` are also columns of `inventory.csv`. The global
+setting `boot_agent` (*Keep NUCs in sync on every boot*) is part of `POST /api/config/save` and is
+injected into the downloaded client script as `DEPLOY_BOOT_AGENT`.
 
 ### `POST /api/register`
 Register a device; optionally specify which pool:
@@ -259,3 +297,86 @@ batch without touching any file.
 ### `GET /api/hooks`
 The ready-to-paste Clonezilla `ocs_prerun` / `ocs_postrun` commands for the current server IP,
 port and default pool (also shown at the bottom of the Network Settings panel).
+
+---
+
+## The pool and the bench must be the same network
+
+A NUC can only reach this server if the address it was given is on the same LAN as the master PC.
+The server detects that LAN itself (`ip -4 -o addr`, ioctl if `ip` is missing, default gateway from
+`ip route` or `/proc/net/route`) and compares it with every pool.
+
+If they differ, startup prints a line like:
+
+```text
+[!] Pool 'default' uses 192.168.100.0/24, but this PC is only on 192.168.169.0/24 (eth0 192.168.169.250)
+```
+
+and the dashboard shows the same warning with **Use this PC's network**. That button (or
+`POST /api/bench/adopt`) rewrites the default pool:
+
+| | Before | After adopt of `192.168.169.250/24`, gateway `.254` |
+|---|---|---|
+| Subnet | `192.168.100.0/24` | `192.168.169.0/24` |
+| Gateway | `192.168.100.1` | `192.168.169.254` |
+| Master / server IP | `192.168.100.1` | `192.168.169.250` |
+| Next NUC | `192.168.100.101` | `192.168.169.101` |
+
+The old range numbers are kept when they fit (101–250 still fits a /24). The gateway and this PC's
+own address are reserved, so the allocator will never give either of them to a unit. Other pools are
+left alone. Units already in `inventory.csv` keep the addresses they were given — edit those by hand
+if they were assigned on the old network.
+
+Two things the software cannot do for you:
+
+1. **Take the NUC range out of the router's DHCP pool** (or unplug the bench from that router).
+   Otherwise the router can hand `192.168.169.101` to a phone while the dashboard thinks a NUC owns it.
+2. **Keep the master on a fixed address.** It is written into every `ocs_prerun` / `ocs_postrun`
+   command. A DHCP address on the master is a batch that cannot phone home tomorrow.
+
+Clonezilla's built-in DHCP only covers the PXE boot and then stops. FileZilla is an FTP server: no
+DHCP service, no IP pool. Neither of them is what assigns the address the deployed image keeps.
+
+---
+
+## Troubleshooting: the NUC keeps a different address
+
+Symptom: the dashboard assigned `192.168.169.101` / `nuc-101`, but the unit comes up as something
+else (often another `192.168.169.x` from the router). The **Seen as** column shows a red cross and
+the address it actually used; the banner names the unit (`nuc-101 checked in from 192.168.169.45
+instead of its assigned address 192.168.169.101`). A green check means the check-in came from the
+assigned address.
+
+Why it happens:
+
+* The cloned image still had DHCP enabled, so on first boot the NIC asked the router and kept that
+  lease. `configure_network.sh` now moves netplan files (including cloud-init's) to
+  `/etc/netplan/mgw-backup`, disables systemd-networkd `DHCP=yes` profiles, sets NetworkManager
+  `autoconnect=false` on `method=auto` profiles, strips ifupdown DHCP stanzas, neutralises
+  `interfaces.d` snippets, and disables cloud-init's network stage. The static file matches the NIC
+  by MAC, not by `en*`.
+* The pool was a different network from the bench, so the "assigned" address was never reachable.
+  Adopt this PC's network (section above) and re-image, or edit the unit.
+* The router still owns the same range. Exclude it, or isolate the switch.
+
+Re-applying without a full re-image:
+
+```bash
+# on the NUC, or against a mounted root with DEPLOY_TARGET_ROOT=
+curl -fsS http://192.168.169.250:8000/client/configure_network.sh | \
+  env DEPLOY_MODE=live bash
+```
+
+`DEPLOY_MODE=live` re-applies the assignment and the DHCP neutralisation, idempotently
+(`files changed: 0` when nothing differs). It does **not** wipe `machine-id` or SSH host keys —
+that only happens in image mode (the Clonezilla post-run). Other switches: `DEPLOY_APPLY=0` (print
+only), `DEPLOY_IFACE=`, `DEPLOY_MAC=`, `DEPLOY_TARGET_ROOT=`, `DEPLOY_CONFIG_FILE=`.
+
+With **Keep NUCs in sync on every boot** left on, the post-run hook installs:
+
+* `/etc/mgw-deploy.conf` — server address, MAC, interface
+* `/usr/local/sbin/mgw-identity.sh` — downloads the current hook and runs it in live mode
+* `mgw-identity.service` — oneshot, `network-online.target`
+
+An IP or computer name changed in the dashboard then lands at the next boot. Turn the setting off
+and the next boot's downloaded script removes the agent (`DEPLOY_BOOT_AGENT=0`).

@@ -10,10 +10,18 @@ Clonezilla Live comes with a built-in feature called **Clonezilla Lite Server**.
    - Laptop or desktop PC with an Ethernet port.
    - Connected to the switch.
    - Holds your Clonezilla Linux image (on internal drive, external SSD, or USB 3.0 drive).
-   - Set static IP on this machine: `192.168.100.1` (Netmask: `255.255.255.0`).
+   - Set a **fixed** IP on this machine (Netmask to match the bench, e.g. `192.168.169.250/24`).
+     That address is baked into every hook command. A DHCP lease on the master will go stale and
+     the next batch will call a server that is no longer there. Reserve it on the router, or set it
+     statically and do not let the router hand it out.
 2. **Gigabit Switch:**
    - 24-port Gigabit Ethernet switch (recommended: unmanaged or managed with IGMP snooping enabled).
    - **Crucial:** Keep this switch disconnected from your company/office LAN during imaging to prevent Clonezilla's PXE/DHCP server from interfering with existing office networks.
+     If the switch stays attached to a router, take the NUC range (for example `192.168.169.101`–`250`)
+     **out of that router's DHCP pool** first. Clonezilla's built-in DHCP only serves the PXE phase and
+     stops afterwards. FileZilla, if you use it to copy the image, is an FTP server — it does not hand
+     out addresses and it has no IP pool. A NUC that can still ask for DHCP after imaging will take
+     whatever the router offers, which is the usual "weird IP".
 3. **Target NUCs:**
    - Connect up to 20 NUCs to the switch via Cat5e/Cat6 patch cables.
    - Plug into power.
@@ -59,6 +67,16 @@ Two more panels matter for batch work:
 The page does not refresh itself: press **Refresh** for the latest state, or switch **Auto-refresh** on
 to poll the tables in place every 5 s while you watch a batch run.
 
+If the pool subnet is not a network this PC actually has an address on, the server prints a warning at
+startup and the dashboard shows the same sentence, with a **Use this PC's network** button. That
+rewrites the default pool (subnet, range numbers when they still fit, gateway, next address) and the
+master IP from the detected interface. Do this before imaging — a pool of `192.168.100.0/24` on a
+bench that is really `192.168.169.0/24` gives every NUC an address it can never use to reach you.
+
+**Keep NUCs in sync on every boot** (on by default) is injected into the downloaded post-run script as
+`DEPLOY_BOOT_AGENT`. Leave it on if you want a dashboard rename to land the next time the unit powers
+on, without re-imaging.
+
 ---
 
 ## 3. Starting Clonezilla Lite Server
@@ -76,6 +94,8 @@ to poll the tables in place every 5 s while you watch a batch run.
 2. **DHCP Service**:
    - Choose: `Use built-in DHCP service`.
    - Clonezilla will automatically assign temporary IP addresses to the NUCs while they boot PXE.
+   - That service ends when the PXE session ends. It is not the DHCP server of the deployed image,
+     and it is not a substitute for a static assignment. FileZilla is not involved in addressing at all.
 3. **Repository (Image Location)**:
    - Select `local_dev` -> choose the partition on your external SSD or USB where your Linux Clonezilla image is stored (e.g. `/home/partimag`).
 4. **Action**:
@@ -129,7 +149,9 @@ When prompted for extra parameters, add:
      - Injects unique IP (e.g., `192.168.100.101` to `192.168.100.120`), or the exact IP that was
        pinned for this unit in the dashboard.
      - Injects hostname (`nuc-101` to `nuc-120`), or the custom computer name pinned for this unit.
+     - Neutralises DHCP in the image and writes the static assignment, matched to this NIC by MAC.
      - Resets `machine-id`.
+     - Installs the on-boot identity agent when that setting is on.
      - Shuts down.
 5. The dashboard turns green for all 20 units.
 6. Unplug the 20 finished NUCs, box them, and plug in Batch 2!
