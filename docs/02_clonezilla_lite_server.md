@@ -129,6 +129,44 @@ When prompted for extra parameters, add:
   ```
 - **Final action**: Choose `-p poweroff` (automatically shuts down the NUC when completed).
 
+### On the netboot menu - what the PXE-booted NUCs actually use
+
+The expert-mode parameters above apply when you drive Clonezilla from local
+media. A NUC that PXE-boots never sees them: its kernel command line comes from
+the menu the lite server generated. Patch that instead, on the master, **after**
+the lite server reaches "now wait for client to connect":
+
+```bash
+sudo tools/patch_clonezilla_client_hooks.sh --self-test   # parse check, touches nothing
+sudo tools/patch_clonezilla_client_hooks.sh --dry-run     # show the diff first
+sudo tools/patch_clonezilla_client_hooks.sh http://192.168.169.2:8000
+sudo tools/patch_clonezilla_client_hooks.sh --restore     # undo
+```
+
+It edits both menus - `/tftpboot/nbi_img/grub/grub.cfg` for uEFI netboot and
+`/tftpboot/nbi_img/pxelinux.cfg/default` for legacy BIOS - refuses to run
+silently when the `ocs-live-get-img` line is missing (wrong mode, or the lite
+server was not started yet), is idempotent, and leaves a `.orig` beside each
+file. **Re-run it whenever the lite server is restarted**: `ocs-live-feed-img`
+regenerates both files from scratch.
+
+Two details worth knowing before you trust a batch:
+
+* `curl -s <url> | bash` **cannot fail**. If the master is unreachable, curl
+  prints nothing, bash runs an empty script, and the exit status is `0` - so the
+  NUC looks "done" and powers off with no network configured and nothing on the
+  console. The patcher's default post-run therefore downloads the hook with
+  `curl -fsS`, runs it, and only powers off when it really succeeded; on failure
+  the unit stays up for 10 minutes with `MGW_Kompy post-run FAILED` on screen.
+  Use `--blind-poweroff` if you want the plain `sleep 3; poweroff` back.
+* `-p poweroff` in the lite-server UI does **not** pre-empt the hooks. Clonezilla
+  skips its own poweroff when `ocs_postrun` is on the kernel command line
+  (`ocs-functions`, `task_postprocessing`); `ocs-live-final-action` powers the
+  unit off after the hooks instead.
+
+`docs/05_clonezilla_hooks_troubleshooting.md` has the full hook order with
+source references and a diagnosis table for a unit that powers off unconfigured.
+
 ---
 
 ## 5. Booting the 20 NUCs

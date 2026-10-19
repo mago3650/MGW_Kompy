@@ -6,3 +6,12 @@ __pycache__/
 server/inventory.csv
 server/network_config.json
 server/ip_pool.csv
+
+# The Clonezilla live payload (vmlinuz, initrd.img, filesystem.squashfs, ...).
+# filesystem.squashfs alone is hundreds of MB, past GitHub's 100 MB per-file
+# limit, so clonezilla/ is committed WITHOUT live/. Nothing in this repo reads
+# it: the PXE clients boot the payload from the master's running Clonezilla
+# media, which ocs-live-feed-img copies into /tftpboot/nbi_img itself.
+# Get it from https://clonezilla.org/downloads.php (same version as
+# clonezilla/Clonezilla-Live-Version) and drop it in if you want a full tree.
+clonezilla/live/

@@ -65,12 +65,21 @@ MGW_Kompy/
 │   ├── configure_network.sh           # Runs in Clonezilla Post-Run hook
 │   └── extract_key_windows.ps1        # Alternative Windows PowerShell key extractor
 ├── tests/
-│   └── test_network_config.py         # python3 tests/test_network_config.py (no dependencies)
+│   ├── test_network_config.py         # python3 tests/test_network_config.py (no dependencies)
+│   └── test_configure_hook.py         # python3 tests/test_configure_hook.py
+├── tools/
+│   └── patch_clonezilla_client_hooks.sh  # injects the hooks into the PXE boot menu on the master
+├── clonezilla/                        # Clonezilla live 3.3.3-37 boot tree, WITHOUT live/
+│                                      # (live/filesystem.squashfs is far past GitHub's 100 MB
+│                                      #  per-file limit, and nothing here reads it - the PXE
+│                                      #  clients boot the payload the lite server copies from
+│                                      #  the master's own Clonezilla media)
 └── docs/
     ├── 01_architecture_overview.md   # System architecture & timing
     ├── 02_clonezilla_lite_server.md   # Step-by-step Clonezilla Lite Server guide
     ├── 03_ip_and_network_config.md   # Netplan / NetworkManager IP injection details
-    └── 04_windows_key_extraction.md   # ACPI MSDM & Registry key technical guide
+    ├── 04_windows_key_extraction.md   # ACPI MSDM & Registry key technical guide
+    └── 05_clonezilla_hooks_troubleshooting.md  # Hook order, poweroff timing, silent failures
 ```
 
 ---
