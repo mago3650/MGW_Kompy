@@ -1,0 +1,4 @@
+The file b3sum.txt contains the b3 checksums of all files on this medium.
+
+You can verify them automatically with the 'verify-checksums' boot parameter,
+or, manually with: 'b3sum -c b3sum.txt'.
